@@ -1,7 +1,8 @@
 # GAT Encoder dependencies
 torch>=2.0.0
 numpy>=1.24.0
+openfhe==1.4.2.0.24.4
 
 # Optional: OpenFHE Python (CKKS + CGGI). Install via pip on supported platforms (e.g. Ubuntu 22.04/24.04).
-# See: https://github.com/openfheorg/openfhe-python#installing-using-pip-for-ubuntu
-# openfhe>=1.4.2.0
+# Uncomment and use a version matching your OS: https://pypi.org/project/openfhe/#history
+# pip install openfhe==1.4.2.0.24.4
