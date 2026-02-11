@@ -83,22 +83,139 @@ Implement **the encoder part** of a Graph Attention Network (GAT) in Python: tra
 
 ---
 
-## 4. FHE Design (Single-Layer Encoder)
+## 4. FHE Design (Fully-Encrypted Single-Layer Encoder)
 
-The **single-layer GAT steps** from §2.2 are implemented under encryption using [OpenFHE Python](https://github.com/openfheorg/openfhe-python):
+The **single-layer GAT** from §2.2 is implemented **entirely under encryption** using [OpenFHE Python](https://github.com/openfheorg/openfhe-python):
 
-| Step | Operation | FHE scheme | Notes |
-|------|------------|------------|--------|
-| 1 | Linear \( h' = W h \) | **CKKS** | Matrix-vector mult via slot-wise plaintext mult + rotation-based sum. |
-| 2 | Attention score \( e_{ij} = \mathrm{LeakyReLU}(a^T [h'_i \| h'_j]) \) | **CKKS** | Inner products in CKKS; LeakyReLU via polynomial (Chebyshev) approximation. |
-| 2 (branching) | If/else (e.g. sign of \( e_{ij} \)) | **CGGI (BinFHE)** | Optional; `cggi_select_bit` and helpers in `gat_encoder_fhe` for boolean circuits. |
-| 3 | Softmax \( \alpha_{ij} = \mathrm{softmax}_j(e_{ij}) \) | **CKKS** | exp via Chebyshev approx; normalization uses decrypted sums (hybrid) or polynomial 1/x. |
-| 4 | Aggregate \( h''_i = \sum_j \alpha_{ij} h'_j \) | **CKKS** | Weighted sum of ciphertexts (EvalMult + EvalAdd). |
+- **CKKS** for all real-valued arithmetic (linear, attention scores, softmax, aggregation)
+- **FHEW/CGGI** for boolean operations (sign, comparisons, if-else)
+- **Scheme Switching (CKKS ↔ FHEW)** to bridge the two schemes when needed
 
-- **Graph structure** (`edge_index`) is plaintext; **node features** are encrypted (one CKKS ciphertext per node, slots = feature vector).
-- **FHE graph type**: `FHEGraph` in `fhe_graph.py` holds `num_nodes`, `in_channels`, `edge_index`, and either `node_features_plain` or `node_features_enc` (list of ciphertexts).
-- **CKKS** is used for real arithmetic (code examples: [CKKS advanced real numbers](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/advanced-real-numbers.py), [function evaluation](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py)).
-- **CGGI** is used for boolean circuits (if/else, comparisons); see [BinFHE examples](https://github.com/openfheorg/openfhe-python/tree/main/examples/binfhe) (e.g. `boolean-ap.py`). Scheme switching (CKKS ↔ CGGI) can be added later for full encrypted branching.
+### 4.1 Overview: No Plaintext Computation
+
+**Key principle**: Node features are encrypted once (at input) and **remain encrypted throughout the entire GAT forward pass**. All operations—linear transforms, attention score computation, LeakyReLU, softmax normalization, and aggregation—are performed **homomorphically**. Only the final output embeddings are decrypted.
+
+### 4.2 Per-Step FHE Implementation
+
+| Step | Operation | FHE Scheme(s) | Implementation Details |
+|------|-----------|---------------|------------------------|
+| **0** | **Encrypt inputs** | CKKS | Node features `x_i` → CKKS ciphertexts; one ciphertext per node with packed feature slots. |
+| **1** | **Linear** \( h'_i = W x_i \) | CKKS | **Homomorphic matrix–vector product**: For each output dimension `d`, compute inner product `sum_k W[d,k] * x_i[k]` using `EvalMult` (slot-wise with plaintext weight row), then `EvalRotate` + `EvalAdd` to sum slots (pattern from [advanced-real-numbers.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/advanced-real-numbers.py)). Result: list of CKKS ciphertexts `h'_i` (one per node). |
+| **2a** | **Attention raw scores** \( e_{ij}^{\text{raw}} = a^T [h'_i \| h'_j] \) | CKKS | Concatenate `h'_i` and `h'_j` in ciphertext space; compute encrypted inner product with attention vector `a` via `EvalMult` + rotations/sums. Result: CKKS ciphertext `e_{ij}^{\text{raw}}` per edge. |
+| **2b** | **LeakyReLU** \( e_{ij} = \text{LeakyReLU}(e_{ij}^{\text{raw}}) \) | CKKS + FHEW (scheme switching) | **Encrypted sign branch**: (1) `EvalCKKStoFHEW`: switch `e_{ij}^{\text{raw}}` from CKKS to FHEW; (2) `EvalSign`: compute encrypted sign bit in FHEW (CGGI); (3) `EvalFHEWtoCKKS`: switch sign bit back to CKKS as indicator `b_{ij}`; (4) Compute `e_{ij} = e_{ij}^{\text{raw}} * b_{ij} + \alpha * e_{ij}^{\text{raw}} * (1 - b_{ij})` in CKKS. Pattern from [scheme-switching.py `ComparisonViaSchemeSwitching()`](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/scheme-switching.py). |
+| **3** | **Softmax** \( \alpha_{ij} = \exp(e_{ij}) / \sum_k \exp(e_{ik}) \) | CKKS | **Chebyshev approximations**: (1) Approximate `exp(e_{ij})` using `EvalChebyshevFunction` (pattern from [function-evaluation.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py)); (2) Sum encrypted exps over neighbors (`EvalAdd`); (3) Approximate `1 / sum` using polynomial inversion or `EvalLogistic`-style function; (4) Multiply to get normalized weights. Result: CKKS ciphertexts `\alpha_{ij}`. |
+| **4** | **Aggregate** \( h''_i = \sum_{j \in \mathcal{N}(i)} \alpha_{ij} h'_j \) | CKKS | Homomorphic weighted sum: `EvalMult(alpha_{ij}, h'_j)` (plaintext scalar or ciphertext-ciphertext mult), then `EvalAdd` over neighbors. Result: CKKS ciphertexts `h''_i`. |
+| **5** | **Decrypt outputs** | CKKS | Decrypt `h''_i` to get final node embeddings. |
+
+### 4.3 Key Technical Components
+
+#### 4.3.1 CKKS Homomorphic Matrix Multiplication
+
+For `h' = W x` where `x` is a CKKS ciphertext with packed features:
+
+```python
+# Pattern from advanced-real-numbers.py rotations
+def matmul_ckks(cc, ct_x, W_plain, keys):
+    # ct_x: CKKS ciphertext with slots [x_0, x_1, ..., x_{F-1}]
+    # W_plain: (F_out, F_in) plaintext weight matrix
+    # Returns: list of F_out CKKS ciphertexts, one per output dimension
+    
+    out_cts = []
+    for d in range(F_out):
+        # Create plaintext for row W[d,:]
+        pt_w = cc.MakeCKKSPackedPlaintext(W_plain[d, :].tolist())
+        # Slot-wise product
+        ct_prod = cc.EvalMult(ct_x, pt_w)
+        # Sum slots via rotations (log2(F_in) depth)
+        ct_sum = sum_slots_via_rotations(cc, ct_prod, F_in, keys)
+        out_cts.append(ct_sum)
+    return out_cts
+```
+
+Requires rotation keys for `[1, 2, 4, ..., F_in/2]`.
+
+#### 4.3.2 Scheme Switching for Encrypted Sign (LeakyReLU)
+
+Pattern from `scheme-switching.py`:
+
+```python
+# Setup (once)
+cc.Enable(PKESchemeFeature.SCHEMESWITCH)
+params = SchSwchParams()
+params.SetSecurityLevelCKKS(sl)
+params.SetSecurityLevelFHEW(slBin)
+params.SetCtxtModSizeFHEWLargePrec(logQ_ccLWE)
+params.SetNumSlotsCKKS(slots)
+privateKeyFHEW = cc.EvalSchemeSwitchingSetup(params)
+ccLWE = cc.GetBinCCForSchemeSwitch()
+cc.EvalSchemeSwitchingKeyGen(keys, privateKeyFHEW)
+
+# Per score e_{ij} (CKKS ciphertext):
+# 1. Switch to FHEW
+pLWE = ccLWE.GetMaxPlaintextSpace()
+scaleSign = 1.0
+cc.EvalCKKStoFHEWPrecompute(scaleSign / pLWE)
+ct_fhew = cc.EvalCKKStoFHEW(ct_e_ij, 1)[0]  # single slot
+
+# 2. Compute sign in FHEW
+ct_sign_fhew = ccLWE.EvalSign(ct_fhew)  # 1 if >= 0, else 0
+
+# 3. Switch sign back to CKKS
+ct_sign_ckks = cc.EvalFHEWtoCKKS([ct_sign_fhew], 1, 1, 2, 0, 2)
+
+# 4. Encrypted LeakyReLU in CKKS
+ct_one = cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext([1.0]))
+ct_one_minus_sign = cc.EvalSub(ct_one, ct_sign_ckks)
+ct_pos_branch = cc.EvalMult(ct_e_ij, ct_sign_ckks)
+ct_neg_branch = cc.EvalMult(cc.EvalMult(ct_e_ij, alpha), ct_one_minus_sign)
+ct_leaky_relu = cc.EvalAdd(ct_pos_branch, ct_neg_branch)
+```
+
+#### 4.3.3 CKKS Softmax via Chebyshev Approximations
+
+Pattern from `function-evaluation.py`:
+
+```python
+# Approximate exp(e_{ij}) for e_{ij} in [lower, upper]
+lower, upper = -5.0, 5.0
+poly_degree = 16
+ct_exp = cc.EvalChebyshevFunction(lambda x: math.exp(x), ct_e_ij, lower, upper, poly_degree)
+
+# Sum exps over neighbors (plaintext loop, encrypted add)
+ct_sum_exp = ct_exp_0
+for k in range(1, num_neighbors):
+    ct_sum_exp = cc.EvalAdd(ct_sum_exp, ct_exp_k)
+
+# Approximate 1 / sum
+# Option 1: Use EvalChebyshevFunction with f(x) = 1/x
+# Option 2: Use polynomial inversion (Newton-Raphson in CKKS)
+ct_inv_sum = cc.EvalChebyshevFunction(lambda x: 1.0/x, ct_sum_exp, lower_sum, upper_sum, poly_degree)
+
+# Normalize: alpha_{ij} = exp(e_{ij}) / sum
+ct_alpha_ij = cc.EvalMult(ct_exp, ct_inv_sum)
+```
+
+### 4.4 Graph Structure and Ciphertext Layout
+
+- **Graph structure** (`edge_index`): **Plaintext** (2, E) array; edges are public.
+- **Node features**: **Encrypted** at input as CKKS ciphertexts; one ciphertext per node with packed slots `[x_0, x_1, ..., x_{F-1}]`.
+- **Intermediate embeddings** (`h'`, `e_{ij}`, `\alpha_{ij}`, `h''`): All remain as **CKKS ciphertexts** (or temporarily FHEW for sign ops, then switched back).
+
+### 4.5 References and Examples
+
+- **CKKS operations**: [advanced-real-numbers.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/advanced-real-numbers.py) (rotations, mult, rescale)
+- **Function evaluation**: [function-evaluation.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py) (`EvalChebyshevFunction`, `EvalLogistic`)
+- **Scheme switching**: [scheme-switching.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/scheme-switching.py) (`EvalCKKStoFHEW`, `EvalFHEWtoCKKS`, `EvalSign`, `ComparisonViaSchemeSwitching`)
+- **BinFHE/CGGI**: [binfhe/boolean.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/binfhe/boolean.py) (boolean gates, `EvalSign`)
+
+### 4.6 Staged Implementation Plan
+
+Given the complexity, implementation proceeds in stages:
+
+1. **Stage 1** (CKKS arithmetic): Implement CKKS-only linear layer (`matmul_ckks` with rotations) and CKKS-only attention score computation (encrypted inner products). Softmax remains plaintext for now.
+2. **Stage 2** (Scheme switching for sign): Replace plaintext LeakyReLU with encrypted sign via CKKS↔FHEW scheme switching (`EvalCKKStoFHEW`, `EvalSign`, `EvalFHEWtoCKKS`).
+3. **Stage 3** (CKKS softmax): Implement encrypted softmax using Chebyshev approximations for `exp` and `1/x`.
+4. **Stage 4** (Integration and docs): Wire all pieces together, update `example_fhe_verify.py`, `README.md`, and verify end-to-end encrypted GAT forward pass.
 
 ---
 
@@ -106,22 +223,34 @@ The **single-layer GAT steps** from §2.2 are implemented under encryption using
 
 ```
 GAT-FHE/
-├── venv/                   # Python virtual environment
-├── requirements.txt         # torch, numpy; optional openfhe
-├── PLAN.md                 # This document
-├── README.md               # How to run
+├── venv312/                 # Python 3.12 virtual environment (for OpenFHE compatibility)
+├── requirements.txt         # torch, numpy; openfhe for FHE
+├── PLAN.md                 # This document (design and staged implementation plan)
+├── README.md               # How to run (setup, examples, FHE notes)
 ├── .gitignore              # Ignore venv, __pycache__, etc.
-├── gat_encoder.py          # GAT encoder (PyTorch, plaintext)
-├── gat_encoder_fhe.py      # GAT single-layer under FHE (CKKS + CGGI helpers)
-├── fhe_graph.py            # FHE-friendly graph/node structures
-├── example_verify.py       # Verify plaintext encoder
-└── example_fhe_verify.py  # Verify FHE encoder (requires openfhe)
+├── gat_encoder.py          # GAT encoder (PyTorch, plaintext reference)
+├── gat_encoder_fhe.py      # GAT single-layer under FHE (fully encrypted: CKKS + FHEW scheme switching)
+├── fhe_graph.py            # FHE-friendly graph/node structures (plaintext edges, encrypted features)
+├── cggi_helpers.py         # FHEW/CGGI + scheme-switching helpers (sign, comparison, CKKS↔FHEW)
+├── example_verify.py       # Verify plaintext encoder (PyTorch)
+└── example_fhe_verify.py  # Verify FHE encoder (requires openfhe; tests fully-encrypted forward)
 ```
 
 ---
 
 ## 6. Success Criteria
 
-- Plaintext encoder runs without errors on synthetic `(x, edge_index)`; output shape `(N, F_out)`, finite.
-- FHE single-layer runs when OpenFHE is installed; decrypted output is finite and matches the intended pipeline (CKKS for linear, LeakyReLU approx, softmax approx, aggregate).
-- Code is modular (layer vs encoder; plain vs FHE) and ready to plug into downstream tasks or FHE experiments.
+### Plaintext Encoder
+- Runs without errors on synthetic `(x, edge_index)`; output shape `(N, F_out)`, all values finite.
+- Gradient flow works (backward pass succeeds).
+
+### Fully-Encrypted FHE Encoder
+- **Stage 1**: CKKS-only linear and attention score computation run without errors; decrypted intermediate values are finite and match plaintext reference (within CKKS precision).
+- **Stage 2**: Encrypted LeakyReLU via CKKS↔FHEW scheme switching produces correct sign-based branching; decrypted outputs match expected behavior.
+- **Stage 3**: Encrypted softmax (Chebyshev-based exp and 1/x) produces normalized attention weights that sum to ~1.0 per node (within approximation error).
+- **Stage 4 (End-to-end)**: Full GAT forward pass runs entirely under encryption (no plaintext arithmetic on features); decrypted final embeddings are finite and qualitatively similar to plaintext reference.
+
+### Modularity and Documentation
+- Code is modular: separate stages for CKKS ops, scheme switching, and Chebyshev function evaluation.
+- `PLAN.md`, `README.md`, and `example_fhe_verify.py` document the staged approach and usage.
+- Ready for downstream experimentation (e.g. multi-layer, training under FHE with approximate gradients, etc.).

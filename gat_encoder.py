@@ -171,3 +171,107 @@ class GATEncoder(nn.Module):
         last_heads = self.layers[-1]
         h = torch.stack([head(h, edge_index) for head in last_heads], dim=0).mean(dim=0)
         return h
+
+
+# ============================================================================
+# NumPy-based plaintext utilities for FHE testing and comparison
+# ============================================================================
+
+import numpy as np
+from typing import Tuple
+
+
+def matmul_plain(x: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """
+    Plaintext matrix multiplication helper.
+
+    - x: shape (N, F_in)
+    - W: shape (F_out, F_in)
+    Returns: (N, F_out) = x @ W.T
+    """
+    return x @ W.T
+
+
+def linear_plain(x: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """Apply linear transformation h' = W @ x in plaintext."""
+    return matmul_plain(x, W)
+
+
+def attention_plain(
+    edge_index: np.ndarray,
+    h: np.ndarray,
+    a: np.ndarray,
+    num_nodes: int,
+    negative_slope: float = 0.2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute attention coefficients alpha over edges (plaintext).
+    
+    edge_index: (2, E) with row 0 = source, row 1 = target
+    h: (N, F_out) transformed node features
+    a: (2*F_out,) attention vector
+    num_nodes: N
+    negative_slope: LeakyReLU slope
+    
+    Returns: (e_scores, alpha) both shape (E,)
+    """
+    row = edge_index[1]  # target
+    col = edge_index[0]  # source
+    h_row = h[row]   # (E, F_out)
+    h_col = h[col]   # (E, F_out)
+    h_cat = np.concatenate([h_row, h_col], axis=1)  # (E, 2*F_out)
+    e_raw = h_cat @ a
+    
+    # LeakyReLU
+    e = np.where(e_raw >= 0, e_raw, negative_slope * e_raw)
+    
+    # Softmax over edges by target
+    e_max = np.full(num_nodes, -np.inf, dtype=np.float64)
+    np.maximum.at(e_max, row, e)
+    e_max = e_max[row]
+    e_exp = np.exp(np.clip(e - e_max, -50, 50))
+    e_sum = np.zeros(num_nodes, dtype=np.float64)
+    np.add.at(e_sum, row, e_exp)
+    e_sum = e_sum[row]
+    e_sum = np.maximum(e_sum, 1e-16)
+    alpha = e_exp / e_sum
+    return e, alpha
+
+
+def gat_forward_plain(
+    x: np.ndarray,
+    edge_index: np.ndarray,
+    W: np.ndarray,
+    a: np.ndarray,
+    negative_slope: float = 0.2,
+) -> np.ndarray:
+    """
+    Single-layer GAT forward pass in plaintext (NumPy).
+    
+    x: (N, F_in) node features
+    edge_index: (2, E) graph structure
+    W: (F_out, F_in) linear weight
+    a: (2*F_out,) attention vector
+    negative_slope: LeakyReLU slope
+    
+    Returns: (N, F_out) output embeddings
+    """
+    num_nodes = x.shape[0]
+    out_channels = W.shape[0]
+    
+    # Linear transform
+    h = linear_plain(x, W)
+    
+    # Attention
+    _, alpha = attention_plain(edge_index, h, a, num_nodes, negative_slope)
+    
+    # Aggregate
+    out = np.zeros((num_nodes, out_channels), dtype=np.float64)
+    row = edge_index[1]
+    col = edge_index[0]
+    for e in range(len(alpha)):
+        i = row[e]
+        j = col[e]
+        out[i] += alpha[e] * h[j]
+    
+    return out

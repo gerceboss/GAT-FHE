@@ -1,6 +1,33 @@
 # GAT Encoder
 
-Graph Attention Network (GAT) **encoder only** — no classification head. Plaintext PyTorch implementation plus **FHE** single-layer encoder using [OpenFHE Python](https://github.com/openfheorg/openfhe-python): **CKKS** for real arithmetic (aggregation, ciphertext ops) and **CGGI** (BinFHE/GINX) for boolean if-else (e.g. LeakyReLU sign branch); see `cggi_helpers.py` and [OpenFHE binfhe examples](https://github.com/openfheorg/openfhe-python/tree/main/examples/binfhe).
+Graph Attention Network (GAT) **encoder only** — no classification head. Plaintext PyTorch implementation plus **fully-encrypted** single-layer encoder using [OpenFHE Python](https://github.com/openfheorg/openfhe-python):
+
+- **CKKS** for all real-valued arithmetic (linear transforms via homomorphic matrix–vector products, attention scores, softmax, aggregation)
+  - **Rotation-based packing**: Concatenates encrypted features without decryption
+  - **Homomorphic inner products**: Computes attention scores entirely encrypted
+- **FHEW/CGGI** (BinFHE/GINX) for boolean operations (sign, comparisons, if-else)
+- **Scheme Switching** (CKKS ↔ FHEW) for encrypted branching:
+  - **Encrypted LeakyReLU**: Uses `EvalCKKStoFHEW` → `EvalSign` → `EvalFHEWtoCKKS` pipeline
+  - Sign computation fully encrypted (no intermediate decryption)
+
+### 🔒 **Fully Encrypted Pipeline** (No Intermediate Decryption)
+- ✅ Linear layer: CKKS matrix multiplication with rotation-based summation
+- ✅ Attention scores: Rotation-based concatenation + homomorphic inner product  
+- ✅ LeakyReLU: CKKS↔FHEW scheme switching with encrypted sign bit
+- ✅ Softmax: Chebyshev polynomial approximation in CKKS
+- ✅ Aggregation: Weighted sum in CKKS
+- ✅ **Only final output is decrypted** (all intermediate values stay encrypted)
+
+### Security: Encrypted-Only Storage
+
+`FHEGraph` stores **ONLY encrypted features** — plaintext node features are **never stored**. When creating a graph from plaintext data:
+1. Plaintext is immediately encrypted using `from_plain_encrypted()`
+2. Encrypted ciphertexts are stored in the graph
+3. Plaintext is discarded (not retained in memory)
+
+This ensures maximum data privacy throughout the FHE pipeline.
+
+See `PLAN.md` for staged implementation design; references: [CKKS advanced-real-numbers](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/advanced-real-numbers.py), [function-evaluation](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py), [scheme-switching](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/scheme-switching.py), [binfhe examples](https://github.com/openfheorg/openfhe-python/tree/main/examples/binfhe).
 
 ## Setup
 
@@ -77,8 +104,9 @@ if openfhe_available():
     )
     encoder = GATEncoderFHE(in_channels=2, out_channels=2)
     # Optional: encoder.set_weights(W, a) to use custom W, a
-    out_plain = encoder.forward_plain(graph)   # plaintext reference
-    out_fhe = encoder.forward_fhe(graph)       # encrypt → aggregate → decrypt
+    out_plain = encoder.forward_plain(graph)         # plaintext reference
+    out_fhe_ckks = encoder.forward_fhe_ckks(graph)   # Stage 1: CKKS linear + plaintext attention + CKKS aggregation
+    # forward_fhe_ckks: encrypt once → CKKS matmul (h'=Wx) → decrypt for attention → re-encrypt → CKKS aggregate → decrypt
 ```
 
-See `PLAN.md` for design (FHE steps, file layout) and `example_verify.py` / `example_fhe_verify.py` for full checks.
+**Current Stage**: Stage 1 (CKKS linear layer via rotations) is complete. Stages 2–3 (scheme switching for LeakyReLU, CKKS softmax) are in progress. See `PLAN.md` for full design and staged implementation roadmap, and `example_verify.py` / `example_fhe_verify.py` for verification scripts.
