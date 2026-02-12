@@ -159,56 +159,6 @@ def encrypted_reciprocal_goldschmidt(
     return ct_f
 
 
-def encrypted_sum_via_rotations(
-    cc: Any,
-    ct: Any,
-    num_slots: int,
-) -> Any:
-    """
-    Sum first num_slots slots of ciphertext via binary tree rotations.
-    
-    Returns: ciphertext with sum replicated in all slots
-    
-    Algorithm: Binary tree reduction
-    - Level 1: add rotate(1)
-    - Level 2: add rotate(2)
-    - Level k: add rotate(2^k)
-    
-    Complexity: O(log(num_slots)) rotations and additions
-    """
-    acc = ct
-    shift = 1
-    while shift < num_slots:
-        rotated = cc.EvalRotate(acc, shift)
-        acc = cc.EvalAdd(acc, rotated)
-        shift *= 2
-    return acc
-
-
-def encrypted_mean_via_rotations(
-    cc: Any,
-    ct: Any,
-    num_slots: int,
-) -> Any:
-    """
-    Compute mean of first num_slots slots encrypted.
-    
-    Returns: ciphertext with mean replicated in all slots
-    
-    Algorithm:
-    1. Sum via rotations
-    2. Divide by num_slots (plaintext multiplication by 1/num_slots)
-    """
-    # Sum all slots
-    ct_sum = encrypted_sum_via_rotations(cc, ct, num_slots)
-    
-    # Divide by num_slots (plaintext division)
-    pt_inv = cc.MakeCKKSPackedPlaintext([1.0 / num_slots] * ct.GetLength())
-    ct_mean = cc.EvalMult(ct_sum, pt_inv)
-    
-    return ct_mean
-
-
 def encrypted_softmax_with_division(
     cc: Any,
     ct_exp_list: List[Any],

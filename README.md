@@ -29,6 +29,28 @@ This ensures maximum data privacy throughout the FHE pipeline.
 
 See `PLAN.md` for staged implementation design; references: [CKKS advanced-real-numbers](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/advanced-real-numbers.py), [function-evaluation](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py), [scheme-switching](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/scheme-switching.py), [binfhe examples](https://github.com/openfheorg/openfhe-python/tree/main/examples/binfhe).
 
+## Repository Structure
+
+```
+GAT-FHE/
+├── gat_encoder/              # Plaintext GAT implementation
+│   ├── __init__.py
+│   └── core.py               # PyTorch and NumPy GAT encoder
+├── gat_encoder_fhe/          # FHE GAT implementation  
+│   ├── __init__.py
+│   ├── encoder.py            # Main FHE encoder (CKKS + FHEW)
+│   ├── fhe_graph.py          # Encrypted graph data structure
+│   ├── fhe_utils.py          # Homomorphic division utilities
+│   └── cggi_helpers.py       # Scheme switching setup
+├── examples/                 # Usage examples
+│   ├── plain_gat.py          # Plaintext GAT verification
+│   ├── fhe_gat.py            # FHE GAT verification
+│   └── test_graph.py         # Hardcoded test graph
+└── tests/                    # Unit tests
+    ├── test_gat_encoder.py      # Plaintext encoder tests
+    └── test_gat_encoder_fhe.py  # FHE encoder tests (skip if no OpenFHE)
+```
+
 ## Setup
 
 **1. Create a virtual environment** (recommended):
@@ -59,12 +81,24 @@ Note: OpenFHE wheels may not be available for the very latest Python versions. I
 
 **Plaintext encoder:**
 ```bash
-python example_verify.py
+python examples/plain_gat.py
 ```
 
 **FHE encoder** (requires `openfhe`):
 ```bash
-python example_fhe_verify.py
+python examples/fhe_gat.py
+```
+
+**Run tests:**
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run only plaintext encoder tests
+pytest tests/test_gat_encoder.py -v
+
+# Run only FHE tests (automatically skipped if OpenFHE not installed)
+pytest tests/test_gat_encoder_fhe.py -v
 ```
 
 Expected: plaintext run prints shapes and OK; FHE run prints decrypted output and completes without error.
@@ -73,7 +107,7 @@ Expected: plaintext run prints shapes and OK; FHE run prints decrypted output an
 
 **Plaintext (PyTorch):**
 ```python
-from gat_encoder import GATEncoder
+from gat_encoder import GATEncoder  # imports from gat_encoder/core.py
 import torch
 
 encoder = GATEncoder(
@@ -89,24 +123,38 @@ edge_index = torch.randint(0, 10, (2, 30))  # 30 edges
 out = encoder(x, edge_index)     # (10, 32)
 ```
 
-**FHE (single layer, CKKS + CGGI helpers):**
+**FHE (fully encrypted, CKKS + CGGI scheme switching):**
 ```python
-from fhe_graph import FHEGraph
-from gat_encoder_fhe import GATEncoderFHE, openfhe_available
+from gat_encoder_fhe import GATEncoderFHE, FHEGraph, openfhe_available
 import numpy as np
 
 if openfhe_available():
-    graph = FHEGraph.from_plain(
+    # Initialize encoder (memory-optimized configuration)
+    encoder = GATEncoderFHE(
+        in_channels=2, 
+        out_channels=2, 
+        batch_size=4, 
+        mult_depth=12,
+        use_cggi=False,  # Set True for encrypted LeakyReLU via scheme switching
+    )
+    
+    # Create encrypted graph (plaintext never stored, only encrypted ciphertexts)
+    x_plain = np.random.randn(4, 2).astype(np.float64) * 0.5
+    edge_index = np.array([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=np.int64)
+    
+    graph = FHEGraph.from_plain_encrypted(
         num_nodes=4,
         in_channels=2,
-        edge_index=np.array([[0, 1, 1, 2], [1, 0, 2, 1]]),
-        node_features=np.random.randn(4, 2).astype(np.float64) * 0.5,
+        edge_index=edge_index,
+        node_features_plain=x_plain,
+        crypto_context=encoder.crypto_context,
+        public_key=encoder.keys.publicKey,
+        batch_size=4,
     )
-    encoder = GATEncoderFHE(in_channels=2, out_channels=2)
-    # Optional: encoder.set_weights(W, a) to use custom W, a
-    out_plain = encoder.forward_plain(graph)         # plaintext reference
-    out_fhe_ckks = encoder.forward_fhe_ckks(graph)   # Stage 1: CKKS linear + plaintext attention + CKKS aggregation
-    # forward_fhe_ckks: encrypt once → CKKS matmul (h'=Wx) → decrypt for attention → re-encrypt → CKKS aggregate → decrypt
+    
+    # Run fully-encrypted forward pass (all ops encrypted, only final output decrypted)
+    out_fhe = encoder.forward_fhe_full(graph)
+    print("FHE output shape:", out_fhe.shape)
 ```
 
-**Current Stage**: Stage 1 (CKKS linear layer via rotations) is complete. Stages 2–3 (scheme switching for LeakyReLU, CKKS softmax) are in progress. See `PLAN.md` for full design and staged implementation roadmap, and `example_verify.py` / `example_fhe_verify.py` for verification scripts.
+**Implementation Status**: All 4 stages complete! Fully-encrypted pipeline with CKKS linear layer, rotation-based attention, encrypted LeakyReLU (scheme switching), encrypted softmax (Chebyshev + Newton-Raphson division), and encrypted aggregation. See `PLAN.md` for design details, `IMPLEMENTATION_SUMMARY.md` for comprehensive documentation, and `examples/` for verification scripts.

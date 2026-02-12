@@ -16,7 +16,7 @@ from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
-from fhe_graph import FHEGraph
+from .fhe_graph import FHEGraph
 from gat_encoder import gat_forward_plain
 
 
@@ -126,7 +126,7 @@ class GATEncoderFHE:
         self._cggi_context = None
         self._fhew_sk = None
         if use_cggi:
-            from cggi_helpers import setup_scheme_switching
+            from .cggi_helpers import setup_scheme_switching
             self._fhew_sk, self._cggi_context = setup_scheme_switching(
                 self._cc, self._keys, self._batch_size
             )
@@ -457,7 +457,7 @@ class GATEncoderFHE:
            c. Multiply each exp by reciprocal (encrypted normalization)
         3. Return encrypted softmax probabilities (NO DECRYPTION)
         """
-        from fhe_utils import encrypted_reciprocal_newton_raphson
+        from .fhe_utils import encrypted_reciprocal_newton_raphson
         
         E = edge_index.shape[1]
 
