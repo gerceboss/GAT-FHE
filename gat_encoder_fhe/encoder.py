@@ -83,7 +83,7 @@ class GATEncoderFHE:
         in_channels: input feature dimension F_in
         out_channels: output feature dimension F_out
         negative_slope: LeakyReLU negative slope
-        batch_size: CKKS batch size (must be >= max(F_in, F_out))
+        batch_size: CKKS batch size (must be >= max(F_in, F_out))  slots used for packing
         mult_depth: CKKS multiplicative depth (higher for complex circuits)
         scale_mod_size: CKKS scaling modulus bit size
         use_cggi: enable CGGI/FHEW scheme switching for encrypted comparisons
@@ -174,6 +174,11 @@ class GATEncoderFHE:
     def crypto_context(self) -> Any:
         """Return CKKS crypto context."""
         return self._cc
+
+    @property
+    def batch_size(self) -> int:
+        """Return CKKS batch size (slots used for packing)."""
+        return self._batch_size
 
     @property
     def keys(self) -> Any:

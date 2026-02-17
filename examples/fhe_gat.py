@@ -46,7 +46,7 @@ def main() -> None:
         batch_size=4,        # Reduced from 8 to save memory
         mult_depth=30,       # Reduced from 30 (less memory but still functional)
         scale_mod_size=40,   # Reduced from 50 (smaller ciphertexts)
-        use_cggi=True,      # Disable scheme switching to save memory (LeakyReLU = identity)
+        use_cggi=False,      # Disable scheme switching to save memory (LeakyReLU = identity)
     )
     
     # IMPORTANT: Set encoder weights to match plaintext encoder

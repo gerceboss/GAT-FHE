@@ -16,6 +16,8 @@ from .fhe_utils import (
     encrypted_softmax_with_division,
 )
 from .cggi_helpers import setup_scheme_switching
+from .metrics import MetricsRecorder, StepMetric
+from .runner import GATRunConfig, run_gat_pipeline
 
 __all__ = [
     "GATEncoderFHE",
@@ -27,4 +29,8 @@ __all__ = [
     "encrypted_reciprocal_goldschmidt",
     "encrypted_softmax_with_division",
     "setup_scheme_switching",
+    "MetricsRecorder",
+    "StepMetric",
+    "GATRunConfig",
+    "run_gat_pipeline",
 ]
