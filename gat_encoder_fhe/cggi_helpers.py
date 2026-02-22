@@ -84,7 +84,7 @@ def setup_scheme_switching(
         from openfhe import HEStd_NotSet  # type: ignore
         security_level_ckks = HEStd_NotSet
     if security_level_fhew is None:
-        security_level_fhew = sym["STD128"]  # TOY for faster demo; use STD128 for real use
+        security_level_fhew = sym["STD128"]  # use STD128 for real use
     
     # Setup scheme switching
     params = SchSwchParams()

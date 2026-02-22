@@ -117,8 +117,9 @@ class GATEncoderFHE:
         self._cc = self._build_context()
         self._keys = self._keygen()
 
-        # Initialize weights (plaintext for now; could be encrypted in advanced setups)
+        # Initialize weights (plaintext; or use _ct_W_list when from_client_keys_with_encrypted_weights)
         self._W = np.random.randn(out_channels, in_channels).astype(np.float64) * 0.1
+        self._ct_W_list = None
         concat_dim = 2 * out_channels
         self._a = np.random.randn(concat_dim).astype(np.float64) * 0.1
 
@@ -130,6 +131,113 @@ class GATEncoderFHE:
             self._fhew_sk, self._cggi_context = setup_scheme_switching(
                 self._cc, self._keys, self._batch_size
             )
+
+    @classmethod
+    def from_client_keys(
+        cls,
+        crypto_context: Any,
+        public_key: Any,
+        in_channels: int,
+        out_channels: int,
+        batch_size: int,
+        W: np.ndarray,
+        a: np.ndarray,
+        negative_slope: float = 0.2,
+    ) -> "GATEncoderFHE":
+        """
+        Create encoder from client-provided crypto context and public key only.
+        Server never receives secret key - can evaluate but NOT decrypt.
+
+        crypto_context: CKKS context with eval keys already loaded (client ran
+            EvalMultKeyGen and EvalRotateKeyGen before sending)
+        public_key: Client's public key
+        W, a: Model weights (server owns these)
+        """
+        if not _OPENFHE_AVAILABLE:
+            raise ImportError(f"OpenFHE not available: {_OPENFHE_ERROR}")
+
+        from .client_keys import _PublicKeyOnly
+
+        self = cls.__new__(cls)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.negative_slope = negative_slope
+        self.use_cggi = False  # Client-key mode is CKKS-only
+
+        self._CCParamsCKKSRNS = _OPENFHE_SYMBOLS.CCParamsCKKSRNS
+        self._GenCryptoContext = _OPENFHE_SYMBOLS.GenCryptoContext
+        self._PKESchemeFeature = _OPENFHE_SYMBOLS.PKESchemeFeature
+        self._SecretKeyDist = _OPENFHE_SYMBOLS.SecretKeyDist
+        self._KeySwitchTechnique = _OPENFHE_SYMBOLS.KeySwitchTechnique
+        self._ScalingTechnique = _OPENFHE_SYMBOLS.ScalingTechnique
+        self._HEStd_128_classic = _OPENFHE_SYMBOLS.HEStd_128_classic
+
+        self._batch_size = batch_size
+        self._mult_depth = 0  # N/A
+        self._scale_mod_size = 0  # N/A
+        self._first_mod_size = 60
+
+        self._cc = crypto_context
+        self._keys = _PublicKeyOnly(public_key)
+        self._W = np.asarray(W, dtype=np.float64)
+        self._a = np.asarray(a, dtype=np.float64)
+        self._ct_W_list = None
+        self._cggi_context = None
+        self._fhew_sk = None
+
+        return self
+
+    @classmethod
+    def from_client_keys_with_encrypted_weights(
+        cls,
+        crypto_context: Any,
+        public_key: Any,
+        in_channels: int,
+        out_channels: int,
+        batch_size: int,
+        ct_W_list: List[Any],
+        a: np.ndarray,
+        negative_slope: float = 0.2,
+    ) -> "GATEncoderFHE":
+        """
+        Create encoder from client-provided crypto context, public key, and
+        ENCRYPTED weights. Server never has secret key.
+        Used for FHE training without decryption: weights stay encrypted,
+        updates done homomorphically (ct_W_new = ct_W_old - lr * ct_grad_W).
+        """
+        if not _OPENFHE_AVAILABLE:
+            raise ImportError(f"OpenFHE not available: {_OPENFHE_ERROR}")
+
+        from .client_keys import _PublicKeyOnly
+
+        self = cls.__new__(cls)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.negative_slope = negative_slope
+        self.use_cggi = False
+
+        self._CCParamsCKKSRNS = _OPENFHE_SYMBOLS.CCParamsCKKSRNS
+        self._GenCryptoContext = _OPENFHE_SYMBOLS.GenCryptoContext
+        self._PKESchemeFeature = _OPENFHE_SYMBOLS.PKESchemeFeature
+        self._SecretKeyDist = _OPENFHE_SYMBOLS.SecretKeyDist
+        self._KeySwitchTechnique = _OPENFHE_SYMBOLS.KeySwitchTechnique
+        self._ScalingTechnique = _OPENFHE_SYMBOLS.ScalingTechnique
+        self._HEStd_128_classic = _OPENFHE_SYMBOLS.HEStd_128_classic
+
+        self._batch_size = batch_size
+        self._mult_depth = 0
+        self._scale_mod_size = 0
+        self._first_mod_size = 60
+
+        self._cc = crypto_context
+        self._keys = _PublicKeyOnly(public_key)
+        self._W = None  # Not used when weights are encrypted
+        self._a = np.asarray(a, dtype=np.float64)
+        self._ct_W_list = list(ct_W_list)
+        self._cggi_context = None
+        self._fhew_sk = None
+
+        return self
 
     def _build_context(self) -> Any:
         """Build CKKS crypto context with scheme switching support."""
@@ -275,6 +383,40 @@ class GATEncoderFHE:
             ct_h_list.append(ct_sum)
 
         return ct_h_list
+
+    def _replicate_slot0_to_slots(self, ct: Any, num_slots: int) -> Any:
+        """
+        Replicate the value in slot 0 to slots 0..num_slots-1.
+        Used for linear backward when grad_h has one value and we need it in all slots.
+        """
+        acc = ct
+        for d in range(1, num_slots):
+            rot = self._cc.EvalRotate(ct, -d)
+            acc = self._cc.EvalAdd(acc, rot)
+        return acc
+
+    def matmul_ckks_encrypted_W(self, ct_x: Any, ct_W_list: List[Any]) -> List[Any]:
+        """
+        CKKS matrix-vector multiplication with ENCRYPTED weights: h' = W @ x.
+        Server can run this without secret key.
+
+        ct_x: ciphertext with x packed in slots
+        ct_W_list: list of F_out ciphertexts, each encrypting row k of W
+        Returns: list of F_out ciphertexts
+        """
+        F_out = len(ct_W_list)
+        ct_h_list = []
+        for k in range(F_out):
+            ct_prod = self._cc.EvalMult(ct_x, ct_W_list[k])
+            ct_sum = self._sum_slots_via_rotations(ct_prod, self.in_channels)
+            ct_h_list.append(ct_sum)
+        return ct_h_list
+
+    def _matmul_ckks_dispatch(self, ct_x: Any) -> List[Any]:
+        """Dispatch to plaintext or encrypted W matmul based on encoder state."""
+        if hasattr(self, "_ct_W_list") and self._ct_W_list is not None:
+            return self.matmul_ckks_encrypted_W(ct_x, self._ct_W_list)
+        return self.matmul_ckks(ct_x, self._W)
 
     # -------------------------------------------------------------------------
     # Stage 2: Encrypted LeakyReLU (CKKS↔FHEW scheme switching)
@@ -617,7 +759,7 @@ class GATEncoderFHE:
         # Step 2: CKKS linear layer (fully encrypted)
         ct_h_prime_list = []
         for i in range(N):
-            ct_h_i = self.matmul_ckks(ct_x_list[i], self._W)
+            ct_h_i = self._matmul_ckks_dispatch(ct_x_list[i])
             ct_h_prime_list.append(ct_h_i)
 
         # Step 3: CKKS attention scores (encrypted inner products)

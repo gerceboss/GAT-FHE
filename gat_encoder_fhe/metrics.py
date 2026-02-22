@@ -114,6 +114,15 @@ class MetricsRecorder:
         print(f"  Plaintext ops: {dec_time:>8.4f}s ({dec_time/total_time*100:>5.1f}%)")
         print("="*80)
 
+    def to_dict(self) -> dict[str, any]:
+        """Convert metrics to a dictionary."""
+        return {m.name: {
+            "seconds": m.seconds,
+            "rss_delta_bytes": m.rss_delta_bytes,
+            "rss_after_bytes": m.rss_after_bytes,
+            "encrypted": m.encrypted,
+        } for m in self._metrics}
+
 
 class _StepContext:
     """Context manager for a single step."""

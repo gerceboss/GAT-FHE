@@ -267,6 +267,51 @@ def estimate_initial_reciprocal_guess(
     return 1.0 / value if value > 1e-6 else 1.0
 
 
+def get_leaky_relu_chebyshev_coefficients(
+    negative_slope: float = 0.2,
+    domain_low: float = -3.0,
+    domain_high: float = 3.0,
+    degree: int = 7,
+) -> list[float]:
+    """
+    Compute Chebyshev polynomial coefficients for LeakyReLU approximation in CKKS.
+
+    LeakyReLU(x) = x if x >= 0 else negative_slope * x
+    Uses numpy.polynomial.chebyshev.chebfit for least-squares fit on the domain.
+
+    Args:
+        negative_slope: LeakyReLU negative slope (default 0.2)
+        domain_low: Lower bound of approximation domain
+        domain_high: Upper bound of approximation domain
+        degree: Polynomial degree
+
+    Returns:
+        List of Chebyshev coefficients for EvalChebyshevSeries(ct, coeffs, domain_low, domain_high)
+    """
+    import numpy as np
+    from numpy.polynomial import chebyshev as Ch
+
+    x = np.linspace(domain_low, domain_high, 300)
+    y = np.where(x >= 0.0, x, negative_slope * x)
+    coeffs = Ch.chebfit(x, y, degree)
+    return [float(c) for c in coeffs]
+
+
+def get_sigmoid_chebyshev_coefficients(
+    domain_low: float = -5.0,
+    domain_high: float = 5.0,
+    degree: int = 7,
+) -> list[float]:
+    """Chebyshev coefficients for sigmoid(x) = 1/(1+exp(-x))."""
+    import numpy as np
+    from numpy.polynomial import chebyshev as Ch
+
+    x = np.linspace(domain_low, domain_high, 300)
+    y = 1.0 / (1.0 + np.exp(-x))
+    coeffs = Ch.chebfit(x, y, degree)
+    return [float(c) for c in coeffs]
+
+
 # Constants for division algorithm selection
 DIV_METHOD_NEWTON_RAPHSON = "newton_raphson"
 DIV_METHOD_GOLDSCHMIDT = "goldschmidt"

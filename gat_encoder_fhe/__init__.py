@@ -17,7 +17,13 @@ from .fhe_utils import (
 )
 from .cggi_helpers import setup_scheme_switching
 from .metrics import MetricsRecorder, StepMetric
-from .runner import GATRunConfig, run_gat_pipeline
+from .runner import (
+    GATRunConfig,
+    run_gat_pipeline,
+    run_gat_pipeline_client_keys,
+    run_gat_pipeline_fhe_training,
+)
+from .client_keys import ClientKeysContext, create_client_context
 
 __all__ = [
     "GATEncoderFHE",
@@ -33,4 +39,8 @@ __all__ = [
     "StepMetric",
     "GATRunConfig",
     "run_gat_pipeline",
+    "run_gat_pipeline_client_keys",
+    "run_gat_pipeline_fhe_training",
+    "ClientKeysContext",
+    "create_client_context",
 ]

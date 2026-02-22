@@ -26,6 +26,7 @@ Mode = Literal["enc", "dec"]
 EvalSignMode = Literal[
     "schemeswitch",  # fully encrypted CKKS<->FHEW + EvalSign
     "decrypt_encrypt_fhew_evalfunc",  # no scheme switching baseline via BinFHE EvalFunc(LUT)
+    "ckks_poly_leakyrelu",  # CKKS-only: polynomial approximation of LeakyReLU (no scheme switch, no decrypt)
 ]
 
 
@@ -54,12 +55,24 @@ class GATRunConfig:
     use_cggi: bool = False
     negative_slope: float = 0.2
 
+    # Client-key mode: return encrypted ciphertexts instead of decrypted output
+    return_encrypted: bool = False
+
+    # FHE training: num_epochs and lr for homomorphic gradient descent
+    num_epochs: int = 0  # 0 = inference only
+    lr: float = 0.01
+
     # Reporting
     print_metrics: bool = True
     print_shapes: bool = False
 
 
-def run_gat_pipeline(*, encoder: GATEncoderFHE, graph: FHEGraph, cfg: GATRunConfig) -> np.ndarray:
+def run_gat_pipeline(
+    *,
+    encoder: GATEncoderFHE,
+    graph: FHEGraph,
+    cfg: GATRunConfig,
+) -> tuple[np.ndarray | list[Any], dict[str, Any]]:
     metrics = MetricsRecorder()
 
     num_nodes = graph.num_nodes
@@ -103,7 +116,7 @@ def run_gat_pipeline(*, encoder: GATEncoderFHE, graph: FHEGraph, cfg: GATRunConf
         if cfg.step1_linear == "enc":
             ct_h_list = []
             for ct_x in ct_x_list:
-                ct_h_list.append(encoder.matmul_ckks(ct_x, encoder._W))
+                ct_h_list.append(encoder._matmul_ckks_dispatch(ct_x))
             h_transformed: Any = ct_h_list
             if cfg.print_shapes:
                 print(f"  Linear(enc): {num_nodes} nodes × {len(ct_h_list[0])} dims")
@@ -209,6 +222,38 @@ def run_gat_pipeline(*, encoder: GATEncoderFHE, graph: FHEGraph, cfg: GATRunConf
                     ct_sign_scaled = encoder.crypto_context.EvalMult(ct_sign, pt_factor)
                     ct_multiplier = encoder.crypto_context.EvalAdd(ct_sign_scaled, pt_neg)
                     e_after.append(encoder.crypto_context.EvalMult(ct_e, ct_multiplier))
+
+        elif cfg.step3_evalsign_mode == "ckks_poly_leakyrelu":
+            # CKKS-only: polynomial approximation of LeakyReLU, no scheme switch, no decrypt
+            from .fhe_utils import get_leaky_relu_chebyshev_coefficients
+
+            with metrics.step("3_ckks_poly_leakyrelu", encrypted=True):
+                if not isinstance(attention_scores, list):
+                    attention_scores = _encrypt_scalar_list_to_ckks_ct_list(
+                        np.asarray(attention_scores, dtype=np.float64)
+                    )
+                elif len(attention_scores) > 0 and isinstance(
+                    attention_scores[0], (float, int, np.floating, np.integer)
+                ):
+                    attention_scores = _encrypt_scalar_list_to_ckks_ct_list(
+                        np.asarray(attention_scores, dtype=np.float64)
+                    )
+
+                coeffs = get_leaky_relu_chebyshev_coefficients(
+                    negative_slope=cfg.negative_slope,
+                    domain_low=-3.0,
+                    domain_high=3.0,
+                    degree=7,
+                )
+                e_after = []
+                for ct_e in attention_scores:
+                    try:
+                        ct_leaky = encoder.crypto_context.EvalChebyshevSeries(
+                            ct_e, coeffs, -3.0, 3.0
+                        )
+                        e_after.append(ct_leaky)
+                    except Exception:
+                        e_after.append(ct_e)
 
         elif cfg.step3_evalsign_mode == "decrypt_encrypt_fhew_evalfunc":
             # No scheme switching at all.
@@ -336,7 +381,10 @@ def run_gat_pipeline(*, encoder: GATEncoderFHE, graph: FHEGraph, cfg: GATRunConf
                 h_to_agg = ct_h_packed_list
 
             out_cts = encoder.aggregate_fhe(h_to_agg, edge_index, alpha_final, num_nodes)
-            output = encoder.decrypt_node_features(out_cts, encoder.out_channels)
+            if cfg.return_encrypted:
+                output = out_cts  # type: ignore[assignment]  # List of ciphertexts
+            else:
+                output = encoder.decrypt_node_features(out_cts, encoder.out_channels)
         else:
             # plaintext aggregation
             if isinstance(h_transformed[0], list):
@@ -362,5 +410,249 @@ def run_gat_pipeline(*, encoder: GATEncoderFHE, graph: FHEGraph, cfg: GATRunConf
     if cfg.print_metrics:
         metrics.print_report()
 
-    return output
+    metrics_dict = metrics.to_dict()
+    return output, metrics_dict
+
+
+def run_gat_pipeline_client_keys(
+    *,
+    encoder: GATEncoderFHE,
+    graph: FHEGraph,
+    print_metrics: bool = True,
+) -> tuple[list[Any], dict[str, Any]]:
+    """
+    Run GAT pipeline in client-key mode: all computation in CKKS, returns
+    encrypted output. Client must decrypt with their secret key.
+
+    encoder: Must be created via GATEncoderFHE.from_client_keys (server has
+        only public key, cannot decrypt)
+    graph: FHEGraph with client-encrypted node features
+    """
+    cfg = GATRunConfig(
+        step1_linear="enc",
+        step2_attention="enc",
+        step3_leakyrelu="enc",
+        step4_softmax="enc",
+        step5_aggregation="enc",
+        step3_evalsign_mode="ckks_poly_leakyrelu",
+        use_cggi=False,
+        return_encrypted=True,
+        print_metrics=print_metrics,
+    )
+    out, metrics_dict = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
+    return out, metrics_dict  # type: ignore[return-value]
+
+
+def run_gat_pipeline_fhe_training(
+    *,
+    encoder: GATEncoderFHE,
+    graph: FHEGraph,
+    ct_labels: list[Any],
+    train_mask: np.ndarray,
+    num_epochs: int = 3,
+    lr: float = 0.01,
+    print_metrics: bool = True,
+) -> tuple[list[Any], dict[str, Any]]:
+    """
+    FHE training loop: forward pass, homomorphic gradient computation, weight update.
+
+    Two modes:
+    - Encrypted weights (no secret key): encoder from from_client_keys_with_encrypted_weights.
+      Weights stay encrypted; update is ct_W_new = ct_W_old - lr * ct_grad_W (all in FHE).
+    - Plaintext weights (has secret key): encoder from GATEncoderFHE(...).
+      Gradient is decrypted, weights updated in plaintext (legacy, server has SK).
+
+    encoder: GATEncoderFHE (with or without secret key; must have encrypted weights for no-SK mode)
+    graph: FHEGraph with encrypted node features
+    ct_labels: list of N ciphertexts (0 or 1 per node) - encrypted labels
+    train_mask: (N,) bool array, True for train nodes (loss computed only on these)
+    num_epochs: number of training epochs
+    lr: learning rate for weight update
+
+    Returns: (encrypted output ciphertexts, metrics dict)
+    """
+    from .fhe_utils import get_sigmoid_chebyshev_coefficients
+
+    has_secret_key = True
+    try:
+        _ = encoder.keys.secretKey
+    except (RuntimeError, AttributeError):
+        has_secret_key = False
+
+    has_encrypted_weights = (
+        hasattr(encoder, "_ct_W_list") and encoder._ct_W_list is not None
+    )
+
+    if not has_encrypted_weights and not has_secret_key:
+        raise ValueError(
+            "run_gat_pipeline_fhe_training: encoder must either have secret key "
+            "(plaintext weights) or encrypted weights (from_client_keys_with_encrypted_weights)."
+        )
+
+    metrics = MetricsRecorder()
+    num_nodes = graph.num_nodes
+    edge_index = graph.edge_index
+    ct_x_list = graph.node_features_enc
+
+    def _decrypt_scalar_ct_list(ct_list: list) -> np.ndarray:
+        vals = np.zeros(len(ct_list), dtype=np.float64)
+        for i, ct in enumerate(ct_list):
+            pt = encoder.crypto_context.Decrypt(encoder.keys.secretKey, ct)
+            pt.SetLength(1)
+            v = pt.GetCKKSPackedValue()[0]
+            vals[i] = float(np.real(complex(v).real))
+        return vals
+
+    def _encrypt_scalar_list_to_ckks_ct_list(values: np.ndarray) -> list:
+        ct_list = []
+        for v in np.asarray(values, dtype=np.float64):
+            packed = [float(v)] * encoder.batch_size
+            pt = encoder.crypto_context.MakeCKKSPackedPlaintext(packed)
+            ct_list.append(encoder.crypto_context.Encrypt(encoder.keys.publicKey, pt))
+        return ct_list
+
+    cfg = GATRunConfig(
+        step1_linear="enc",
+        step2_attention="enc",
+        step3_leakyrelu="enc",
+        step4_softmax="enc",
+        step5_aggregation="enc",
+        step3_evalsign_mode="ckks_poly_leakyrelu",
+        use_cggi=False,
+        return_encrypted=True,
+        print_metrics=False,
+    )
+
+    sigmoid_coeffs = get_sigmoid_chebyshev_coefficients(domain_low=-5.0, domain_high=5.0, degree=7)
+    cc = encoder.crypto_context
+
+    for epoch in range(num_epochs):
+        with metrics.step(f"epoch_{epoch+1}_forward", encrypted=True):
+            # Forward pass (reuse run_gat_pipeline logic)
+            out_cts, ct_h_list, ct_alpha_list = _run_forward_with_intermediates(
+                encoder, graph, cfg, metrics
+            )
+
+        with metrics.step(f"epoch_{epoch+1}_grad_out", encrypted=True):
+            # grad_out = sigmoid(out) - y  (BCE gradient); zero for non-train nodes
+            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.batch_size)
+            ct_grad_out_list = []
+            for i in range(num_nodes):
+                if not train_mask[i]:
+                    ct_grad_out_list.append(cc.Encrypt(encoder.keys.publicKey, pt_zero))
+                else:
+                    ct_sig = cc.EvalChebyshevSeries(out_cts[i], sigmoid_coeffs, -5.0, 5.0)
+                    ct_grad = cc.EvalSub(ct_sig, ct_labels[i])
+                    ct_grad_out_list.append(ct_grad)
+
+        with metrics.step(f"epoch_{epoch+1}_aggregate_backward", encrypted=True):
+            # grad_h[src] += alpha[edge] * grad_out[dst]  (aggregation backward)
+            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.batch_size)
+            ct_grad_h = [
+                [cc.Encrypt(encoder.keys.publicKey, pt_zero) for _ in range(encoder.out_channels)]
+                for _ in range(num_nodes)
+            ]
+            for e in range(edge_index.shape[1]):
+                src, dst = edge_index[0, e], edge_index[1, e]
+                term = cc.EvalMult(ct_alpha_list[e], ct_grad_out_list[dst])
+                for k in range(encoder.out_channels):
+                    ct_grad_h[src][k] = cc.EvalAdd(ct_grad_h[src][k], term)
+
+        with metrics.step(f"epoch_{epoch+1}_linear_backward", encrypted=True):
+            # grad_W[k] = sum_n (x_n * grad_h_n[k]) for train nodes only
+            F_in = encoder.in_channels
+            F_out = encoder.out_channels
+            grad_W_enc = []
+            for k in range(F_out):
+                acc = None
+                for n in range(num_nodes):
+                    if not train_mask[n]:
+                        continue
+                    term = cc.EvalMult(ct_x_list[n], ct_grad_h[n][k])
+                    if acc is None:
+                        acc = term
+                    else:
+                        acc = cc.EvalAdd(acc, term)
+                grad_W_enc.append(acc)
+
+        with metrics.step(f"epoch_{epoch+1}_weight_update", encrypted=has_encrypted_weights):
+            F_out = encoder.out_channels
+            pt_lr = cc.MakeCKKSPackedPlaintext([lr] * encoder.batch_size)
+            if has_encrypted_weights:
+                # FHE update: ct_W_new = ct_W_old - lr * ct_grad_W (no secret key)
+                for k in range(F_out):
+                    if grad_W_enc[k] is None:
+                        continue
+                    ct_scaled_grad = cc.EvalMult(grad_W_enc[k], pt_lr)
+                    encoder._ct_W_list[k] = cc.EvalSub(encoder._ct_W_list[k], ct_scaled_grad)
+            else:
+                # Plaintext update (legacy: server has secret key)
+                F_in = encoder.in_channels
+                grad_W_plain = np.zeros((F_out, F_in), dtype=np.float64)
+                for k in range(F_out):
+                    if grad_W_enc[k] is None:
+                        continue
+                    pt = cc.Decrypt(encoder.keys.secretKey, grad_W_enc[k])
+                    pt.SetLength(F_in)
+                    vals = pt.GetCKKSPackedValue()
+                    grad_W_plain[k] = np.real([complex(v).real for v in vals[:F_in]])
+                encoder._W = encoder._W.astype(np.float64) - lr * grad_W_plain
+
+        if print_metrics and (epoch + 1) % 1 == 0:
+            if has_encrypted_weights:
+                print(f"  FHE epoch {epoch+1}/{num_epochs} (encrypted weights)")
+            else:
+                print(f"  FHE epoch {epoch+1}/{num_epochs}  |W|={np.linalg.norm(encoder._W):.4f}")
+
+    cfg_final = GATRunConfig(
+        step1_linear="enc", step2_attention="enc", step3_leakyrelu="enc",
+        step4_softmax="enc", step5_aggregation="enc",
+        step3_evalsign_mode="ckks_poly_leakyrelu", use_cggi=False,
+        return_encrypted=True, print_metrics=print_metrics,
+    )
+    out_cts, _, _ = _run_forward_with_intermediates(encoder, graph, cfg_final, metrics)
+    return out_cts, metrics.to_dict()
+
+
+def _run_forward_with_intermediates(
+    encoder: GATEncoderFHE,
+    graph: FHEGraph,
+    cfg: GATRunConfig,
+    metrics: "MetricsRecorder",
+) -> tuple[list[Any], list[list[Any]], list[Any]]:
+    """Run forward pass and return (out_cts, ct_h_list, ct_alpha_list) for training."""
+    num_nodes = graph.num_nodes
+    edge_index = graph.edge_index
+    ct_x_list = graph.node_features_enc
+
+    with metrics.step("1_linear", encrypted=True):
+        ct_h_list = [encoder._matmul_ckks_dispatch(ct_x) for ct_x in ct_x_list]
+
+    with metrics.step("2_attention", encrypted=True):
+        attention_scores = encoder.attention_scores_ckks(ct_h_list, edge_index, num_nodes)
+
+    with metrics.step("3_leakyrelu", encrypted=True):
+        from .fhe_utils import get_leaky_relu_chebyshev_coefficients
+        coeffs = get_leaky_relu_chebyshev_coefficients(
+            negative_slope=cfg.negative_slope, domain_low=-3.0, domain_high=3.0, degree=7
+        )
+        e_after = []
+        for ct_e in attention_scores:
+            ct_leaky = encoder.crypto_context.EvalChebyshevSeries(ct_e, coeffs, -3.0, 3.0)
+            e_after.append(ct_leaky)
+
+    with metrics.step("4_softmax", encrypted=True):
+        ct_alpha_list = encoder.softmax_ckks_chebyshev(e_after, edge_index, num_nodes)
+
+    with metrics.step("5_aggregation", encrypted=True):
+        ct_h_packed = []
+        for i in range(num_nodes):
+            ct_packed = ct_h_list[i][0]
+            for k in range(1, encoder.out_channels):
+                ct_rot = encoder.crypto_context.EvalRotate(ct_h_list[i][k], k)
+                ct_packed = encoder.crypto_context.EvalAdd(ct_packed, ct_rot)
+            ct_h_packed.append(ct_packed)
+        out_cts = encoder.aggregate_fhe(ct_h_packed, edge_index, ct_alpha_list, num_nodes)
+
+    return out_cts, ct_h_list, ct_alpha_list
 
