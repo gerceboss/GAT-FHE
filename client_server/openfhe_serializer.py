@@ -1,290 +1,626 @@
 """
-Serialize/deserialize OpenFHE objects (CryptoContext, PublicKey, Ciphertext) for HTTP.
-Uses OpenFHE's native Serialize(..., BINARY) and Deserialize* from file.
-Payloads are converted to/from a JSON-serializable dict of base64-encoded bytes.
+OpenFHE TCP transport: zero-copy binary serialization over raw TCP sockets.
+
+Protocol (all lengths are little-endian uint64):
+  - Each "frame" is:  [8 bytes: payload_length][payload_bytes]
+  - A "message" is a sequence of frames, preceded by a frame count.
+  - Numpy arrays are sent as: [8 bytes dtype_len][dtype_str][8 bytes ndim]
+    [ndim * 8 bytes shape][raw array bytes]
+  - Scalars / small metadata are packed with struct.
+  - The full train/infer payloads are sent as a structured sequence of frames
+    defined by TRAIN_PAYLOAD_FIELDS / INFER_PAYLOAD_FIELDS order.
+
+No base64. No JSON wrapping of FHE objects. No intermediate string copies.
+OpenFHE BINARY mode is used throughout (most compact native format).
+
+Bootstrap nullptr fix:
+  client_keys.py calls:
+      cc.EvalBootstrapSetup(levelBudget=[4,4], slots=slots)
+  This builds precomputation tables inside the CryptoContext that are keyed
+  to a SPECIFIC slot count.  These tables are NOT serialized with the context.
+  After the server deserializes the context it has no tables at all, so
+  EvalBootstrap() crashes: "KeySwitchDown(): Input ciphertext is nullptr".
+
+  Fix: send bootstrap_level_budget ([4,4] by default) as part of the train
+  payload.  recv_train_payload() replays:
+      cc.EvalBootstrapSetup(levelBudget=bootstrap_level_budget, slots=slots)
+  using the SAME level_budget AND the SAME slot count (slots is already
+  in the common payload).  This restores the tables without the secret key.
 """
 
 from __future__ import annotations
 
-import base64
-import json
-import os
-import tempfile
-from typing import Any, Dict, List
+import pickle
+import socket
+import struct
+import io
+import sys
+import traceback
+from typing import Any, List, Tuple, Dict
 
 import numpy as np
 
-# OpenFHE enum instance for binary serialization (openfhe.BINARY, not openfhe.SERBINARY)
+# ── OpenFHE lazy import ────────────────────────────────────────────────────
+
 _OPENFHE = None
 
 
-def _openfhe():
+def _of():
     global _OPENFHE
     if _OPENFHE is None:
         import openfhe
-        # Use enum instance: openfhe.BINARY / openfhe.JSON (not SERBINARY/SERJSON class)
-        if not hasattr(openfhe, "BINARY"):
-            raise ImportError("OpenFHE Python must provide BINARY enum for serialization")
+
         _OPENFHE = openfhe
     return _OPENFHE
 
 
-def _bytes_to_file(data: bytes, suffix: str = ".bin") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
+# ── Low-level frame I/O ───────────────────────────────────────────────────
+# A "frame" = 8-byte LE length prefix + raw bytes.
+# We use memoryview + recv_into to avoid extra copies on the receive path.
+
+_HDR = struct.Struct("<Q")  # unsigned 64-bit LE
+
+
+def _send_frame(sock: socket.socket, data: bytes | bytearray | memoryview) -> None:
+    """Send one length-prefixed frame. data must support the buffer protocol."""
+    sock.sendall(_HDR.pack(len(data)))
+    sock.sendall(data)
+
+
+def _recv_exactly(sock: socket.socket, n: int) -> bytes:
+    """Read exactly n bytes from sock; avoids per-recv allocations for large n."""
+    if n == 0:
+        return b""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        got = sock.recv_into(view[pos:], n - pos)
+        if not got:
+            raise EOFError(f"Connection closed after {pos}/{n} bytes")
+        pos += got
+    return bytes(buf)
+
+
+def _recv_frame(sock: socket.socket) -> bytes:
+    """Receive one length-prefixed frame."""
+    hdr = _recv_exactly(sock, 8)
+    length = _HDR.unpack(hdr)[0]
+    return _recv_exactly(sock, length)
+
+
+# ── OpenFHE object serialization (BINARY, no base64) ─────────────────────
+
+
+def _ser_obj(obj: Any) -> bytes:
+    of = _of()
+    s = of.Serialize(obj, of.BINARY)
+    return s if isinstance(s, bytes) else s.encode("latin-1")
+
+
+def serialize_obj(obj: Any) -> bytes:
+    return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def deserialize_obj(data: bytes) -> Any:
+    return pickle.loads(data)
+
+
+def _deser_cc(data: bytes) -> Any:
+    """
+    Deserialize CryptoContext from OpenFHE BINARY payload.
+
+    OpenFHE Python bindings expect (bytes, SERBINARY). Passing a decoded str
+    with SERBINARY triggers a TypeError.
+    """
+    of = _of()
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(f"Expected bytes for BINARY CryptoContext, got {type(data)}")
+    return of.DeserializeCryptoContextString(bytes(data), of.BINARY)
+
+
+def _deser_pk(data: bytes) -> Any:
+    of = _of()
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(f"Expected bytes for BINARY PublicKey, got {type(data)}")
+    return of.DeserializePublicKeyString(bytes(data), of.BINARY)
+
+
+def _deser_ct(data: bytes) -> Any:
+    of = _of()
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(f"Expected bytes for BINARY Ciphertext, got {type(data)}")
+    return of.DeserializeCiphertextString(bytes(data), of.BINARY)
+
+
+def _ser_eval_mult(cc: Any) -> bytes:
+    of = _of()
     try:
-        os.write(fd, data)
-    finally:
-        os.close(fd)
-    return path
+        key_tag = cc.GetKeyTag()
+    except Exception:
+        key_tag = ""
+    s = of.SerializeEvalMultKeyString(of.BINARY, key_tag)
+    return s if isinstance(s, bytes) else s.encode("latin-1")
 
 
-def _serialize_obj(obj: Any) -> bytes:
-    of = _openfhe()
-    return of.Serialize(obj, of.BINARY)
-
-
-def _deserialize_cc(data: bytes):
-    of = _openfhe()
-    path = _bytes_to_file(data, ".cc")
+def _ser_eval_rot(cc: Any) -> bytes:
+    of = _of()
     try:
-        cc, ok = of.DeserializeCryptoContext(path, of.BINARY)
-        if not ok:
-            raise RuntimeError("DeserializeCryptoContext failed")
-        return cc
-    finally:
-        os.unlink(path)
+        key_tag = cc.GetKeyTag()
+    except Exception:
+        key_tag = ""
+    s = of.SerializeEvalAutomorphismKeyString(of.BINARY, key_tag)
+    return s if isinstance(s, bytes) else s.encode("latin-1")
 
 
-def _deserialize_pk(data: bytes):
-    of = _openfhe()
-    path = _bytes_to_file(data, ".pk")
+def _deser_eval_mult(data: bytes, cc: Any) -> None:
+    of = _of()
     try:
-        pk, ok = of.DeserializePublicKey(path, of.BINARY)
-        if not ok:
-            raise RuntimeError("DeserializePublicKey failed")
-        return pk
-    finally:
-        os.unlink(path)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(f"Expected bytes for BINARY EvalMultKey, got {type(data)}")
+        of.DeserializeEvalMultKeyString(bytes(data), of.BINARY)
+    except RuntimeError as exc:
+        if "Can not save a EvalMultKeys vector" not in str(exc):
+            raise
 
 
-def _deserialize_ct(data: bytes):
-    of = _openfhe()
-    path = _bytes_to_file(data, ".ct")
+def _deser_eval_rot(data: bytes, cc: Any) -> None:
+    of = _of()
     try:
-        ct, ok = of.DeserializeCiphertext(path, of.BINARY)
-        if not ok:
-            raise RuntimeError("DeserializeCiphertext failed")
-        return ct
-    finally:
-        os.unlink(path)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                f"Expected bytes for BINARY EvalAutomorphismKey, got {type(data)}"
+            )
+        of.DeserializeEvalAutomorphismKeyString(bytes(data), of.BINARY)
+    except RuntimeError as exc:
+        if "Can not save a EvalAutomorphismKeys vector" not in str(exc):
+            raise
 
 
-def _serialize_eval_mult_key(crypto_context: Any) -> bytes:
-    """Serialize EvalMultKey from the given context to bytes (keyTag default)."""
-    of = _openfhe()
-    fd, path = tempfile.mkstemp(suffix=".emk")
-    os.close(fd)
+# ── Bootstrap setup replay ────────────────────────────────────────────────
+
+
+def _replay_bootstrap_setup(cc: Any, level_budget: list, slots: int) -> None:
+    """
+    Replay EvalBootstrapSetup() on a freshly-deserialized CryptoContext.
+
+    Must be called with the SAME levelBudget and slots the client passed to
+    EvalBootstrapSetup() during key generation. The slot count is critical:
+    OpenFHE keys the precomputed DFT/linear-transform tables to the exact
+    slot count, and calling EvalBootstrap() with the wrong (or missing)
+    tables causes "KeySwitchDown(): Input ciphertext is nullptr".
+
+    This call does NOT require the secret key — it only rebuilds plaintext-
+    side precomputation tables.
+    """
+    import sys
+
     try:
-        # Static method on context's class; keyTag "" uses default key
-        ok = type(crypto_context).SerializeEvalMultKey(path, of.BINARY, "")
-        if not ok:
-            raise RuntimeError("SerializeEvalMultKey failed")
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        cc.EvalBootstrapSetup(levelBudget=level_budget, slots=slots)
+    except Exception as exc:
+        # Context built without FHE enabled (--no_bootstrap path) — safe to skip.
+        print(
+            f"[serializer] EvalBootstrapSetup(levelBudget={level_budget}, "
+            f"slots={slots}) skipped ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
 
 
-def _serialize_eval_automorphism_key(crypto_context: Any) -> bytes:
-    """Serialize EvalAutomorphismKey (rotation keys) from the given context to bytes."""
-    of = _openfhe()
-    fd, path = tempfile.mkstemp(suffix=".erk")
-    os.close(fd)
-    try:
-        ok = type(crypto_context).SerializeEvalAutomorphismKey(path, of.BINARY, "")
-        if not ok:
-            raise RuntimeError("SerializeEvalAutomorphismKey failed")
-        with open(path, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+# ── Ciphertext list helpers ───────────────────────────────────────────────
 
 
-def _deserialize_eval_mult_key_into_context(data: bytes, crypto_context: Any) -> None:
-    """Deserialize EvalMultKey from bytes and load into the given context (in-place)."""
-    of = _openfhe()
-    path = _bytes_to_file(data, ".emk")
-    try:
-        ok = type(crypto_context).DeserializeEvalMultKey(path, of.BINARY)
-        if not ok:
-            raise RuntimeError("DeserializeEvalMultKey failed")
-    finally:
-        os.unlink(path)
+def _send_ct_list(sock: socket.socket, cts: List[Any]) -> None:
+    """Send list length then each ciphertext as a frame."""
+    _send_frame(sock, _HDR.pack(len(cts)))
+    for ct in cts:
+        _send_frame(sock, _ser_obj(ct))
 
 
-def _deserialize_eval_automorphism_key_into_context(data: bytes, crypto_context: Any) -> None:
-    """Deserialize EvalAutomorphismKey from bytes and load into the given context (in-place)."""
-    of = _openfhe()
-    path = _bytes_to_file(data, ".erk")
-    try:
-        ok = type(crypto_context).DeserializeEvalAutomorphismKey(path, of.BINARY)
-        if not ok:
-            raise RuntimeError("DeserializeEvalAutomorphismKey failed")
-    finally:
-        os.unlink(path)
+def _recv_ct_list(sock: socket.socket) -> List[Any]:
+    n = _HDR.unpack(_recv_frame(sock))[0]
+    return [_deser_ct(_recv_frame(sock)) for _ in range(n)]
 
 
-def _serialize_ct_list(ct_list: List[Any]) -> List[str]:
-    return [base64.b64encode(_serialize_obj(ct)).decode("ascii") for ct in ct_list]
+# ── Numpy array helpers ───────────────────────────────────────────────────
 
 
-def _deserialize_ct_list(b64_list: List[str]) -> List[Any]:
-    return [_deserialize_ct(base64.b64decode(s)) for s in b64_list]
+def _send_ndarray(sock: socket.socket, arr: np.ndarray) -> None:
+    """Send dtype string, shape, then raw bytes — no copies for the bulk data."""
+    dtype_b = arr.dtype.str.encode("ascii")  # e.g. b"<f8"
+    shape_b = struct.pack(f"<Q{len(arr.shape)}q", len(arr.shape), *arr.shape)
+    _send_frame(sock, dtype_b)
+    _send_frame(sock, shape_b)
+    # Use tobytes() only; for very large arrays consider arr.data (memoryview)
+    _send_frame(sock, arr.tobytes())
 
 
-def _ndarray_to_b64(arr: np.ndarray) -> str:
-    data = arr.tobytes()
-    meta = {"shape": list(arr.shape), "dtype": str(arr.dtype)}
-    return base64.b64encode(json.dumps({"meta": meta, "data": base64.b64encode(data).decode("ascii")}).encode()).decode("ascii")
+def _recv_ndarray(sock: socket.socket) -> np.ndarray:
+    dtype = np.dtype(_recv_frame(sock).decode("ascii"))
+    shape_raw = _recv_frame(sock)
+    ndim = struct.unpack_from("<Q", shape_raw)[0]
+    shape = struct.unpack_from(f"<{ndim}q", shape_raw, 8)
+    raw = _recv_frame(sock)
+    return np.frombuffer(raw, dtype=dtype).reshape(shape)
 
 
-def _ndarray_from_b64(s: str) -> np.ndarray:
-    raw = json.loads(base64.b64decode(s).decode())
-    meta = raw["meta"]
-    data = base64.b64decode(raw["data"])
-    return np.frombuffer(data, dtype=meta["dtype"]).reshape(meta["shape"])
+# ── Scalar / string helpers ───────────────────────────────────────────────
 
 
-# ---------------------------------------------------------------------------
-# Public API: payload dict <-> JSON-serializable dict for HTTP
-# ---------------------------------------------------------------------------
+def _send_scalar(sock: socket.socket, fmt: str, *values) -> None:
+    _send_frame(sock, struct.pack(fmt, *values))
 
-def serialize_train_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert train payload (with OpenFHE objects) to JSON-serializable dict."""
+
+def _recv_scalar(sock: socket.socket, fmt: str):
+    data = _recv_frame(sock)
+    result = struct.unpack(fmt, data)
+    return result[0] if len(result) == 1 else result
+
+
+def _send_str(sock: socket.socket, s: str) -> None:
+    _send_frame(sock, s.encode("utf-8"))
+
+
+def _recv_str(sock: socket.socket) -> str:
+    return _recv_frame(sock).decode("utf-8")
+
+
+# ── Metrics dict (sent as JSON frame — small, human-readable) ─────────────
+
+
+def _send_metrics(sock: socket.socket, metrics: dict) -> None:
+    import json
+
+    _send_frame(sock, json.dumps(metrics).encode("utf-8"))
+
+
+def _recv_metrics(sock: socket.socket) -> dict:
+    import json
+
+    return json.loads(_recv_frame(sock).decode("utf-8"))
+
+
+# ── int list (for bootstrap_level_budget) ────────────────────────────────
+
+
+def _send_int_list(sock: socket.socket, lst: list) -> None:
+    """Send a short list of signed 64-bit ints as [count][v0][v1]..."""
+    _send_frame(sock, struct.pack(f"<Q{len(lst)}q", len(lst), *lst))
+
+
+def _recv_int_list(sock: socket.socket) -> list:
+    raw = _recv_frame(sock)
+    count = struct.unpack_from("<Q", raw)[0]
+    return list(struct.unpack_from(f"<{count}q", raw, 8))
+
+
+# ── High-level payload send/recv ─────────────────────────────────────────
+#
+# Order is fixed and must match between client and server.
+# Common prefix (cc, pk, eval_mult, eval_rot, ct_W_list, node_features_enc,
+#                in_channels, out_channels, slots, a, negative_slope,
+#                num_nodes, edge_index)
+# Train-only suffix: ct_labels, train_mask, num_epochs, lr, print_metrics,
+#                    bootstrap_weights, bootstrap_level_budget
+# Infer-only suffix: print_metrics
+
+
+def send_common_payload(sock: socket.socket, payload: dict) -> None:
+    """Send fields shared by both train and infer payloads."""
     cc = payload["crypto_context"]
-    return {
-        "crypto_context_b64": base64.b64encode(_serialize_obj(cc)).decode("ascii"),
-        "public_key_b64": base64.b64encode(_serialize_obj(payload["public_key"])).decode("ascii"),
-        "eval_mult_key_b64": base64.b64encode(_serialize_eval_mult_key(cc)).decode("ascii"),
-        "eval_automorphism_key_b64": base64.b64encode(_serialize_eval_automorphism_key(cc)).decode("ascii"),
-        "ct_W_list_b64": _serialize_ct_list(payload["ct_W_list"]),
-        "node_features_enc_b64": _serialize_ct_list(payload["node_features_enc"]),
-        "ct_labels_b64": _serialize_ct_list(payload["ct_labels"]),
-        "in_channels": int(payload["in_channels"]),
-        "out_channels": int(payload["out_channels"]),
-        "batch_size": int(payload["batch_size"]),
-        "a_b64": _ndarray_to_b64(np.asarray(payload["a"], dtype=np.float64)),
-        "negative_slope": float(payload["negative_slope"]),
-        "num_nodes": int(payload["num_nodes"]),
-        "edge_index_b64": _ndarray_to_b64(np.asarray(payload["edge_index"], dtype=np.int64)),
-        "train_mask_b64": _ndarray_to_b64(np.asarray(payload["train_mask"], dtype=bool)),
-        "num_epochs": int(payload["num_epochs"]),
-        "lr": float(payload["lr"]),
-        "print_metrics": bool(payload.get("print_metrics", True)),
-        "bootstrap_weights": bool(payload.get("bootstrap_weights", True)),
-    }
+    _send_frame(sock, _ser_obj(cc))
+    _send_frame(sock, _ser_obj(payload["public_key"]))
+    _send_frame(sock, _ser_eval_mult(cc))
+    _send_frame(sock, _ser_eval_rot(cc))
+    _send_ct_list(sock, payload["ct_W_list"])
+    _send_ct_list(sock, payload["node_features_enc"])
+    _send_scalar(
+        sock, "<qqq", payload["in_channels"], payload["out_channels"], payload["slots"]
+    )
+    _send_ndarray(sock, np.asarray(payload["a"], dtype=np.float64))
+    _send_scalar(sock, "<d", float(payload["negative_slope"]))
+    _send_scalar(sock, "<q", int(payload["num_nodes"]))
+    _send_ndarray(sock, np.asarray(payload["edge_index"], dtype=np.int64))
 
 
-def deserialize_train_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert JSON-serializable dict back to train payload with OpenFHE objects."""
-    cc = _deserialize_cc(base64.b64decode(data["crypto_context_b64"]))
-    pk = _deserialize_pk(base64.b64decode(data["public_key_b64"]))
-    _deserialize_eval_mult_key_into_context(base64.b64decode(data["eval_mult_key_b64"]), cc)
-    _deserialize_eval_automorphism_key_into_context(base64.b64decode(data["eval_automorphism_key_b64"]), cc)
+def recv_common_payload(sock: socket.socket) -> dict:
+    """Receive fields shared by both train and infer payloads."""
+    cc = _deser_cc(_recv_frame(sock))
+    pk = _deser_pk(_recv_frame(sock))
+    _deser_eval_mult(_recv_frame(sock), cc)
+    _deser_eval_rot(_recv_frame(sock), cc)
+    ct_W_list = _recv_ct_list(sock)
+    node_features_enc = _recv_ct_list(sock)
+    in_ch, out_ch, slots = struct.unpack("<qqq", _recv_frame(sock))
+    a = _recv_ndarray(sock)
+    neg_slope = struct.unpack("<d", _recv_frame(sock))[0]
+    num_nodes = struct.unpack("<q", _recv_frame(sock))[0]
+    edge_index = _recv_ndarray(sock)
+    if edge_index.ndim == 2 and edge_index.shape[0] != 2:
+        edge_index = edge_index.T
     return {
         "crypto_context": cc,
         "public_key": pk,
-        "ct_W_list": _deserialize_ct_list(data["ct_W_list_b64"]),
-        "node_features_enc": _deserialize_ct_list(data["node_features_enc_b64"]),
-        "ct_labels": _deserialize_ct_list(data["ct_labels_b64"]),
-        "in_channels": data["in_channels"],
-        "out_channels": data["out_channels"],
-        "batch_size": data["batch_size"],
-        "a": _ndarray_from_b64(data["a_b64"]),
-        "negative_slope": data["negative_slope"],
-        "num_nodes": data["num_nodes"],
-        "edge_index": _ndarray_from_b64(data["edge_index_b64"]),
-        "train_mask": _ndarray_from_b64(data["train_mask_b64"]),
-        "num_epochs": data["num_epochs"],
-        "lr": data["lr"],
-        "print_metrics": data["print_metrics"],
-        "bootstrap_weights": data.get("bootstrap_weights", True),
+        "ct_W_list": ct_W_list,
+        "node_features_enc": node_features_enc,
+        "in_channels": int(in_ch),
+        "out_channels": int(out_ch),
+        "slots": int(slots),
+        "a": a,
+        "negative_slope": neg_slope,
+        "num_nodes": int(num_nodes),
+        "edge_index": edge_index,
     }
 
 
-def serialize_infer_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert infer payload to JSON-serializable dict."""
-    cc = payload["crypto_context"]
+def send_train_payload(sock: socket.socket, payload: dict) -> None:
+    send_common_payload(sock, payload)
+    _send_ct_list(sock, payload["ct_labels"])
+    _send_ndarray(sock, np.asarray(payload["train_mask"], dtype=bool))
+    _send_scalar(
+        sock,
+        "<qd??",
+        int(payload["num_epochs"]),
+        float(payload["lr"]),
+        bool(payload.get("print_metrics", True)),
+        bool(payload.get("bootstrap_weights", True)),
+    )
+    # Send the level_budget so the server can replay EvalBootstrapSetup with
+    # the exact same parameters (levelBudget AND slots=slots) the client
+    # used during key generation.  Default [4,4] matches client_keys.py.
+    _send_int_list(sock, list(payload.get("bootstrap_level_budget", [4, 4])))
+
+
+def recv_train_payload(sock: socket.socket) -> dict:
+    payload = recv_common_payload(sock)
+    payload["ct_labels"] = _recv_ct_list(sock)
+    payload["train_mask"] = _recv_ndarray(sock)
+    num_epochs, lr, print_metrics, bootstrap_weights = struct.unpack(
+        "<qd??", _recv_frame(sock)
+    )
+    payload["num_epochs"] = int(num_epochs)
+    payload["lr"] = float(lr)
+    payload["print_metrics"] = bool(print_metrics)
+    payload["bootstrap_weights"] = bool(bootstrap_weights)
+    payload["bootstrap_level_budget"] = _recv_int_list(sock)
+
+    # ── Replay EvalBootstrapSetup to rebuild precomputation tables ────────
+    # Must pass BOTH levelBudget and slots=slots to exactly match what
+    # client_keys.py called:
+    #   cc.EvalBootstrapSetup(levelBudget=level_budget, slots=slots)
+    # Using the wrong slot count (or omitting it, which defaults to ringDim/2)
+    # leaves the tables mismatched and EvalBootstrap() crashes with nullptr.
+    if payload["bootstrap_weights"]:
+        _replay_bootstrap_setup(
+            payload["crypto_context"],
+            payload["bootstrap_level_budget"],
+            slots=payload["slots"],  # <-- critical: must match client
+        )
+
+    return payload
+
+
+def send_infer_payload(sock: socket.socket, payload: dict) -> None:
+    send_common_payload(sock, payload)
+    _send_scalar(sock, "<?", bool(payload.get("print_metrics", False)))
+
+
+def recv_infer_payload(sock: socket.socket) -> dict:
+    payload = recv_common_payload(sock)
+    payload["print_metrics"] = bool(struct.unpack("<?", _recv_frame(sock))[0])
+    return payload
+
+
+# ── Result send/recv ──────────────────────────────────────────────────────
+
+
+def send_train_result(
+    sock: socket.socket, out_cts: List[Any], metrics: dict, ct_W_trained: List[Any]
+) -> None:
+    _send_ct_list(sock, out_cts)
+    _send_metrics(sock, metrics)
+    _send_ct_list(sock, ct_W_trained)
+
+
+def recv_train_result(sock: socket.socket) -> Tuple[List[Any], dict, List[Any]]:
+    out_cts = _recv_ct_list(sock)
+    metrics = _recv_metrics(sock)
+    ct_W_trained = _recv_ct_list(sock)
+    return out_cts, metrics, ct_W_trained
+
+
+def send_infer_result(sock: socket.socket, out_cts: List[Any], metrics: dict) -> None:
+    _send_ct_list(sock, out_cts)
+    _send_metrics(sock, metrics)
+
+
+def recv_infer_result(sock: socket.socket) -> Tuple[List[Any], dict]:
+    out_cts = _recv_ct_list(sock)
+    metrics = _recv_metrics(sock)
+    return out_cts, metrics
+
+
+def recv_gradient_step_payload(sock: socket.socket) -> dict:
+    payload = recv_common_payload(sock)
+
+    payload["ct_labels"] = _recv_ct_list(sock)
+
+    lr, num_epochs = struct.unpack("<dq", _recv_frame(sock))
+    payload["lr"] = float(lr)
+    payload["num_epochs"] = int(num_epochs)
+
+    # Replay bootstrap
+    _replay_bootstrap_setup(
+        payload["crypto_context"],
+        level_budget=[4, 4],
+        slots=payload["slots"],
+    )
+
+    return payload
+
+
+def send_gradient_step_payload(sock: socket.socket, payload: dict) -> None:
+    send_common_payload(sock, payload)
+
+    _send_ct_list(sock, payload["ct_labels"])
+
+    _send_scalar(
+        sock,
+        "<dq",
+        float(payload["lr"]),
+        int(payload["num_epochs"]),
+    )
+
+
+def send_gradient_step_result(
+    sock: socket.socket, ct_W_new: List[Any], metrics: dict
+) -> None:
+    """
+    Send gradient-step result back to client.
+
+    Wire format mirrors a subset of send_train_result:
+      [ct_W_new list][metrics dict as JSON frame]
+    """
+    _send_ct_list(sock, ct_W_new)
+    _send_metrics(sock, metrics)
+
+
+def recv_gradient_step_result(sock: socket.socket) -> Tuple[List[Any], dict]:
+    """
+    Receive gradient-step result from server.
+
+    Returns:
+      (ct_W_new list, metrics dict)
+    """
+    ct_W_new = _recv_ct_list(sock)
+    metrics = _recv_metrics(sock)
+    return ct_W_new, metrics
+
+
+# ── Error frame ───────────────────────────────────────────────────────────
+# Server sends b"\x00" for OK, b"\x01" + error-msg frame on error.
+
+
+def send_ok(sock: socket.socket) -> None:
+    _send_frame(sock, b"\x00")
+
+
+def send_error(sock: socket.socket, exc: Exception) -> None:
+    tb = traceback.format_exc()
+    msg = f"{type(exc).__name__}: {exc}\n{tb}"
+    _send_frame(sock, b"\x01")
+    _send_str(sock, msg)
+
+
+def recv_status(sock: socket.socket) -> None:
+    """Raise RuntimeError on server error, else return None."""
+    status = _recv_frame(sock)
+    if status == b"\x01":
+        msg = _recv_str(sock)
+        raise RuntimeError(f"Server error:\n{msg}")
+    # b"\x00" = ok
+
+
+# ── Trained-weight persistence (save / load to disk) ─────────────────────
+#
+# Saves everything a client needs to skip re-training and go straight to
+# inference:
+#
+#   <save_dir>/
+#     meta.json          — F_in, F_out, slots, negative_slope, n_weights,
+#     W_{k}.bin          — one file per trained weight
+#     a.npy              — plaintext attention parameter vector
+#
+# The SecretKey is NEVER sent to the server; it is stored only on the client
+# machine in the save directory so future inference runs can decrypt outputs.
+
+
+def save_trained_weights(
+    save_dir: str,
+    W_list,  # numpy array (F_out, F_in)
+    a,  # numpy array
+    slots: int,
+    F_in: int,
+    F_out: int,
+) -> None:
+    import json
+    import os
+    import numpy as np
+
+    save_dir = str(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+
+    meta = {
+        "F_in": int(F_in),
+        "F_out": int(F_out),
+        "slots": int(slots),
+    }
+
+    with open(os.path.join(save_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    # Save plaintext weight matrix
+    np.save(os.path.join(save_dir, "W.npy"), np.asarray(W_list, dtype=np.float64))
+
+    # Save plaintext attention vector
+    np.save(os.path.join(save_dir, "a.npy"), np.asarray(a, dtype=np.float64))
+
+    print(f"[weights] saved plaintext weights → {save_dir}")
+
+
+def load_trained_weights(save_dir: str) -> dict:
+    """
+    Load plaintext-trained weights from disk.
+
+    Expected directory contents:
+        meta.json
+        W.npy
+        a.npy
+
+    Returns:
+        {
+            "W_list": numpy array (F_out, F_in),
+            "a": numpy array,
+            "slots": int,
+            "F_in": int,
+            "F_out": int,
+        }
+    """
+    import json
+    import os
+    import numpy as np
+
+    save_dir = str(save_dir)
+    if not os.path.isdir(save_dir):
+        raise FileNotFoundError(f"Weights directory not found: {save_dir!r}")
+
+    # ── Load metadata ─────────────────────────────────────────────
+    meta_path = os.path.join(save_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(f"meta.json not found in {save_dir!r}")
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    F_in = int(meta["F_in"])
+    F_out = int(meta["F_out"])
+    slots = int(meta["slots"])
+
+    # ── Load plaintext weights ─────────────────────────────────────
+    W_path = os.path.join(save_dir, "W.npy")
+    a_path = os.path.join(save_dir, "a.npy")
+
+    if not os.path.exists(W_path):
+        raise FileNotFoundError(f"W.npy not found in {save_dir!r}")
+    if not os.path.exists(a_path):
+        raise FileNotFoundError(f"a.npy not found in {save_dir!r}")
+
+    W_list = np.load(W_path)
+    a = np.load(a_path)
+
     return {
-        "crypto_context_b64": base64.b64encode(_serialize_obj(cc)).decode("ascii"),
-        "public_key_b64": base64.b64encode(_serialize_obj(payload["public_key"])).decode("ascii"),
-        "eval_mult_key_b64": base64.b64encode(_serialize_eval_mult_key(cc)).decode("ascii"),
-        "eval_automorphism_key_b64": base64.b64encode(_serialize_eval_automorphism_key(cc)).decode("ascii"),
-        "ct_W_list_b64": _serialize_ct_list(payload["ct_W_list"]),
-        "node_features_enc_b64": _serialize_ct_list(payload["node_features_enc"]),
-        "in_channels": int(payload["in_channels"]),
-        "out_channels": int(payload["out_channels"]),
-        "batch_size": int(payload["batch_size"]),
-        "a_b64": _ndarray_to_b64(np.asarray(payload["a"], dtype=np.float64)),
-        "negative_slope": float(payload["negative_slope"]),
-        "num_nodes": int(payload["num_nodes"]),
-        "edge_index_b64": _ndarray_to_b64(np.asarray(payload["edge_index"], dtype=np.int64)),
-        "print_metrics": bool(payload.get("print_metrics", False)),
+        "W_list": W_list,
+        "a": a,
+        "slots": slots,
+        "F_in": F_in,
+        "F_out": F_out,
     }
-
-
-def deserialize_infer_payload(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert JSON-serializable dict back to infer payload."""
-    cc = _deserialize_cc(base64.b64decode(data["crypto_context_b64"]))
-    pk = _deserialize_pk(base64.b64decode(data["public_key_b64"]))
-    _deserialize_eval_mult_key_into_context(base64.b64decode(data["eval_mult_key_b64"]), cc)
-    _deserialize_eval_automorphism_key_into_context(base64.b64decode(data["eval_automorphism_key_b64"]), cc)
-    return {
-        "crypto_context": cc,
-        "public_key": pk,
-        "ct_W_list": _deserialize_ct_list(data["ct_W_list_b64"]),
-        "node_features_enc": _deserialize_ct_list(data["node_features_enc_b64"]),
-        "in_channels": data["in_channels"],
-        "out_channels": data["out_channels"],
-        "batch_size": data["batch_size"],
-        "a": _ndarray_from_b64(data["a_b64"]),
-        "negative_slope": data["negative_slope"],
-        "num_nodes": data["num_nodes"],
-        "edge_index": _ndarray_from_b64(data["edge_index_b64"]),
-        "print_metrics": data["print_metrics"],
-    }
-
-
-def serialize_train_result(out_cts: List[Any], metrics_dict: Dict, ct_W_trained: List[Any]) -> Dict[str, Any]:
-    """Serialize (out_cts, metrics_dict, ct_W_trained) to JSON-serializable dict."""
-    return {
-        "out_cts_b64": _serialize_ct_list(out_cts),
-        "metrics": metrics_dict,
-        "ct_W_trained_b64": _serialize_ct_list(ct_W_trained),
-    }
-
-
-def deserialize_train_result(data: Dict[str, Any]) -> tuple:
-    """Deserialize to (out_cts, metrics_dict, ct_W_trained)."""
-    out_cts = _deserialize_ct_list(data["out_cts_b64"])
-    ct_W_trained = _deserialize_ct_list(data["ct_W_trained_b64"])
-    return out_cts, data["metrics"], ct_W_trained
-
-
-def serialize_infer_result(out_cts: List[Any], metrics_dict: Dict) -> Dict[str, Any]:
-    """Serialize (out_cts, metrics_dict) to JSON-serializable dict."""
-    return {
-        "out_cts_b64": _serialize_ct_list(out_cts),
-        "metrics": metrics_dict,
-    }
-
-
-def deserialize_infer_result(data: Dict[str, Any]) -> tuple:
-    """Deserialize to (out_cts, metrics_dict)."""
-    return _deserialize_ct_list(data["out_cts_b64"]), data["metrics"]

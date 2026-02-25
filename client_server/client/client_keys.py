@@ -36,7 +36,7 @@ class ClientKeysContext:
     """Client-owned keypair and crypto context. Only client has secret key."""
     crypto_context: Any
     keys: Any
-    batch_size: int
+    slots: int
 
     def encrypt_node_features(self, x: np.ndarray, in_channels: int) -> list[Any]:
         cc = self.crypto_context
@@ -46,7 +46,7 @@ class ClientKeysContext:
             raise ValueError(f"x columns {F} != in_channels {in_channels}")
         ct_list = []
         for i in range(N):
-            row = np.zeros(self.batch_size, dtype=np.float64)
+            row = np.zeros(self.slots, dtype=np.float64)
             row[:in_channels] = x[i]
             pt = cc.MakeCKKSPackedPlaintext(row.tolist())
             ct_list.append(cc.Encrypt(pk, pt))
@@ -60,7 +60,7 @@ class ClientKeysContext:
             raise ValueError(f"W columns {F_in} != in_channels {in_channels}")
         ct_list = []
         for k in range(F_out):
-            row = np.zeros(self.batch_size, dtype=np.float64)
+            row = np.zeros(self.slots, dtype=np.float64)
             row[:in_channels] = W[k]
             pt = cc.MakeCKKSPackedPlaintext(row.tolist())
             ct_list.append(cc.Encrypt(pk, pt))
@@ -78,11 +78,22 @@ class ClientKeysContext:
             x[i] = np.real([complex(v).real for v in vals[:feature_dim]])
         return x
 
+    def decrypt_weight_matrix(self, ct_list: list[Any], in_channels: int) -> np.ndarray:
+        cc = self.crypto_context
+        sk = self.keys.secretKey
+        N = len(ct_list)
+        W = np.zeros((N, in_channels), dtype=np.float64)
+        for i, ct in enumerate(ct_list):
+            pt = cc.Decrypt(sk, ct)
+            pt.SetLength(in_channels)
+            vals = pt.GetCKKSPackedValue()
+            W[i] = np.real([complex(v).real for v in vals[:in_channels]])
+        return W
 
 def create_client_context(
     in_channels: int,
     out_channels: int,
-    batch_size: int = 32,
+    slots: int = 32,
     mult_depth: int = 25,
     scale_mod_size: int = 50,
     ring_dim: int = 16384,
@@ -121,7 +132,7 @@ def create_client_context(
 
     params.SetScalingModSize(scale_mod_size)
     params.SetFirstModSize(60)
-    params.SetBatchSize(batch_size)
+    params.SetBatchSize(slots)
     params.SetSecretKeyDist(SecretDist.UNIFORM_TERNARY)
     params.SetScalingTechnique(Scaling.FLEXIBLEAUTO)
     params.SetKeySwitchTechnique(KeySwitch.HYBRID)
@@ -148,13 +159,13 @@ def create_client_context(
 
     keys = cc.KeyGen()
     cc.EvalMultKeyGen(keys.secretKey)
-    max_rot = min(2 * max(in_channels, out_channels), 2 * batch_size)
+    max_rot = min(2 * max(in_channels, out_channels), 2 * slots)
     rotation_indices = list(range(1, max_rot + 1))
     cc.EvalRotateKeyGen(keys.secretKey, rotation_indices)
 
     if bootstrap:
-        # Use batch_size slots so precomputations match EvalBootstrapKeyGen (else "Precomputations for N slots not found")
-        cc.EvalBootstrapSetup(levelBudget=level_budget, slots=batch_size)
-        cc.EvalBootstrapKeyGen(keys.secretKey, batch_size)
+        # Use slots so precomputations match EvalBootstrapKeyGen (else "Precomputations for N slots not found")
+        cc.EvalBootstrapSetup(levelBudget=level_budget, slots=slots)
+        cc.EvalBootstrapKeyGen(keys.secretKey, slots)
 
-    return ClientKeysContext(crypto_context=cc, keys=keys, batch_size=batch_size)
+    return ClientKeysContext(crypto_context=cc, keys=keys, slots=slots)

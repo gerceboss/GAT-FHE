@@ -51,7 +51,7 @@ class GATEncoderCKKS:
         public_key: Any,
         in_channels: int,
         out_channels: int,
-        batch_size: int,
+        slots: int,
         ct_W_list: List[Any],
         a: np.ndarray,
         negative_slope: float = 0.2,
@@ -62,7 +62,7 @@ class GATEncoderCKKS:
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.negative_slope = negative_slope
-        self._batch_size = batch_size
+        self._slots = slots
         self._cc = crypto_context
         self._keys = _PublicKeyOnly(public_key)
         self._a = np.asarray(a, dtype=np.float64)
@@ -74,8 +74,8 @@ class GATEncoderCKKS:
         return self._cc
 
     @property
-    def batch_size(self) -> int:
-        return self._batch_size
+    def slots(self) -> int:
+        return self._slots
 
     @property
     def keys(self) -> Any:
@@ -129,8 +129,8 @@ class GATEncoderCKKS:
                 else:
                     ct_h_j_packed = self._cc.EvalAdd(ct_h_j_packed, ct_rotated)
             ct_concat = self._cc.EvalAdd(ct_h_i_packed, ct_h_j_packed)
-            a_padded = np.zeros(self._batch_size, dtype=np.float64)
-            a_padded[: min(2 * F_out, self._batch_size)] = a_concat[: min(2 * F_out, self._batch_size)]
+            a_padded = np.zeros(self._slots, dtype=np.float64)
+            a_padded[: min(2 * F_out, self._slots)] = a_concat[: min(2 * F_out, self._slots)]
             pt_a = self._cc.MakeCKKSPackedPlaintext(a_padded.tolist())
             ct_weighted = self._cc.EvalMult(ct_concat, pt_a)
             ct_e_ij = self._sum_slots_via_rotations(ct_weighted, 2 * F_out)
@@ -166,7 +166,7 @@ class GATEncoderCKKS:
             initial_guess = 1.0 / max(1.0, num_incoming * 0.5)
             # 1 Newton iteration to save depth (2 iters was pushing over 50 levels)
             ct_reciprocal = encrypted_reciprocal_newton_raphson(
-                self._cc, ct_sum, num_iterations=1, initial_guess=initial_guess, batch_size=self._batch_size
+                self._cc, ct_sum, num_iterations=1, initial_guess=initial_guess, slots=self._slots
             )
             for idx in edge_indices:
                 ct_alpha_list[idx] = self._cc.EvalMult(ct_exp_list[idx], ct_reciprocal)
@@ -186,7 +186,7 @@ class GATEncoderCKKS:
             mask = edge_index[1] == t
             edge_indices = np.where(mask)[0]
             if len(edge_indices) == 0:
-                zeros = [0.0] * self._batch_size
+                zeros = [0.0] * self._slots
                 pt_zero = self._cc.MakeCKKSPackedPlaintext(zeros)
                 ct_zero = self._cc.Encrypt(self._keys.publicKey, pt_zero)
                 out_cts.append(ct_zero)
@@ -198,7 +198,7 @@ class GATEncoderCKKS:
                     term = self._cc.EvalMult(ct_list[cols_j[k]], alpha[edge_idx])
                 else:
                     w = alpha[edge_idx]
-                    pt_scale = self._cc.MakeCKKSPackedPlaintext([w] * self._batch_size)
+                    pt_scale = self._cc.MakeCKKSPackedPlaintext([w] * self._slots)
                     term = self._cc.EvalMult(ct_list[cols_j[k]], pt_scale)
                 if acc is None:
                     acc = term

@@ -10,11 +10,11 @@ def encrypted_reciprocal_newton_raphson(
     ct_denominator: Any,
     num_iterations: int = 3,
     initial_guess: float = 1.0,
-    batch_size: int = 8,
+    slots: int = 8,
 ) -> Any:
     """Compute encrypted 1/d via Newton-Raphson in CKKS."""
-    pt_x = cc.MakeCKKSPackedPlaintext([initial_guess] * batch_size)
-    pt_two = cc.MakeCKKSPackedPlaintext([2.0] * batch_size)
+    pt_x = cc.MakeCKKSPackedPlaintext([initial_guess] * slots)
+    pt_two = cc.MakeCKKSPackedPlaintext([2.0] * slots)
     ct_x = cc.EvalMult(ct_denominator, pt_x)
     for _ in range(num_iterations):
         ct_dx = cc.EvalMult(ct_denominator, ct_x)

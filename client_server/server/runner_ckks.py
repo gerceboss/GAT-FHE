@@ -10,7 +10,7 @@ import numpy as np
 
 from .encoder_ckks import GATEncoderCKKS
 from .fhe_graph import FHEGraph
-from .fhe_utils_ckks import get_leaky_relu_chebyshev_coefficients, get_sigmoid_chebyshev_coefficients
+from .fhe_utils_ckks import encrypted_reciprocal_newton_raphson, get_leaky_relu_chebyshev_coefficients, get_sigmoid_chebyshev_coefficients
 from .metrics import MetricsRecorder
 
 
@@ -60,7 +60,7 @@ def run_gat_pipeline_fhe_training(
             )
 
         with metrics.step(f"epoch_{epoch+1}_grad_out", encrypted=True):
-            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.batch_size)
+            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.slots)
             ct_grad_out_list = []
             for i in range(num_nodes):
                 if not train_mask[i]:
@@ -71,7 +71,7 @@ def run_gat_pipeline_fhe_training(
                     ct_grad_out_list.append(ct_grad)
 
         with metrics.step(f"epoch_{epoch+1}_aggregate_backward", encrypted=True):
-            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.batch_size)
+            pt_zero = cc.MakeCKKSPackedPlaintext([0.0] * encoder.slots)
             ct_grad_h = [
                 [cc.Encrypt(encoder.keys.publicKey, pt_zero) for _ in range(encoder.out_channels)]
                 for _ in range(num_nodes)
@@ -100,13 +100,16 @@ def run_gat_pipeline_fhe_training(
 
         with metrics.step(f"epoch_{epoch+1}_weight_update", encrypted=True):
             F_out = encoder.out_channels
-            pt_lr = cc.MakeCKKSPackedPlaintext([lr] * encoder.batch_size)
+            pt_lr = cc.MakeCKKSPackedPlaintext([lr] * encoder.slots)
             for k in range(F_out):
                 if grad_W_enc[k] is None:
                     continue
                 ct_scaled_grad = cc.EvalMult(grad_W_enc[k], pt_lr)
                 encoder._ct_W_list[k] = cc.EvalSub(encoder._ct_W_list[k], ct_scaled_grad)
 
+        # Free memory
+        import gc
+        gc.collect()
         # Bootstrap only the encrypted weights after each epoch (refreshes levels; do NOT bootstrap activations/gradients)
         if bootstrap_weights:
             with metrics.step(f"epoch_{epoch+1}_bootstrap_weights", encrypted=True):
@@ -114,6 +117,8 @@ def run_gat_pipeline_fhe_training(
                     encoder._ct_W_list[k] = cc.EvalBootstrap(encoder._ct_W_list[k])
             if print_metrics:
                 print(f"  Bootstrap weights (refresh levels) done for epoch {epoch+1}")
+        # Free memory
+        gc.collect()
 
         if print_metrics and (epoch + 1) % 1 == 0:
             print(f"  FHE epoch {epoch+1}/{num_epochs} (encrypted weights)")
@@ -153,6 +158,12 @@ def _run_forward_with_intermediates(
     with metrics.step("4_softmax", encrypted=True):
         ct_alpha_list = encoder.softmax_ckks_chebyshev(e_after, edge_index, num_nodes)
 
+    # Free memory
+    import gc
+    del attention_scores
+    del e_after
+    gc.collect()
+
     with metrics.step("5_aggregation", encrypted=True):
         ct_h_packed = []
         for i in range(num_nodes):
@@ -162,5 +173,9 @@ def _run_forward_with_intermediates(
                 ct_packed = encoder.crypto_context.EvalAdd(ct_packed, ct_rot)
             ct_h_packed.append(ct_packed)
         out_cts = encoder.aggregate_fhe(ct_h_packed, edge_index, ct_alpha_list, num_nodes)
+
+    # Free memory
+    del ct_h_packed
+    gc.collect()
 
     return out_cts, ct_h_list, ct_alpha_list
