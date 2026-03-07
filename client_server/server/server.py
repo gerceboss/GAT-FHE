@@ -40,7 +40,8 @@ from .fhe_graph import FHEGraph
 
 # from .runner_ckks import run_gat_pipeline_fhe_training, run_gat_forward_only
 from .gpt_runner import run_gat_pipeline_fhe_training, run_gat_forward_only
-from .metrics import MetricsRecorder
+# from .metrics import MetricsRecorder
+from .metrics_pi import MetricsRecorder
 
 
 import csv
@@ -88,12 +89,14 @@ def _bootstrap_output_cts(
     import sys as _sys
 
     # ---- Real memory measurement ----
-    def _rss_bytes():
+    def _rss_bytes() -> int:
+        """Return resident set size in bytes (Linux)."""
         try:
-            with open("/proc/self/status", "r") as f:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
-                        return int(line.split()[1]) * 1024
+                        parts = line.split()
+                        return int(parts[1]) * 1024  # kB → bytes
         except Exception:
             return 0
         return 0

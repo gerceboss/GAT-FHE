@@ -750,7 +750,7 @@ def main() -> None:
             if args.host:
                 W, a, batch_metrics_rows = tcp_gradient_step(args.host, args.port, train_payload)
             else:
-                from plain_server import compute_plain_training_batch
+                from client_server.server.plain_server import compute_plain_training_batch
 
                 W, a, batch_metrics_rows = compute_plain_training_batch(
                     x_batch=train_payload["x_batch"],
