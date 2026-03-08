@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-CKKS-only FHE GAT client: raw TCP transport.
+CKKS-only FHE GAT client: raw TCP transport. Line-graph (dual graph) formulation.
 
-Data flow (train then infer; no test data during training):
-  Phase 1 (train): Client sends TRAIN graph only. Server returns
-    (out_cts_train, metrics, ct_W_trained).
-  Phase 2 (infer): Client sends FULL graph + ct_W_trained.
-    Server returns (out_cts, metrics). Client decrypts.
+We build the line graph once: each node = one original edge; features on nodes.
+  Phase 1 (train): For each batch of train edges, client builds a line-graph
+    subgraph (build_line_graph_batch), encrypts node features and labels, sends
+    gradient-step payload (with train_mask on target nodes). Server runs node-level
+    GAT and returns updated encrypted weights. No test data during training.
+  Phase 2 (infer): For each batch of test edges, client builds line-graph subgraph,
+    encrypts, sends infer payload. Server returns encrypted node logits; client
+    decrypts and takes logits[target_indices] as predictions per original edge.
+  Metrics (precision, recall, F1) are computed over original edges.
 
 Usage:
   # In-process (no network):
@@ -15,15 +19,6 @@ Usage:
   # TCP server on same machine or LAN:
   # Terminal 1:  python -m client_server.server.server --host 0.0.0.0 --port 9999
   # Terminal 2:  python -m client_server.client.client --epochs 3 --host 192.168.x.x --port 9999
-
-Bootstrap nullptr fix:
-  client_keys.py calls cc.EvalBootstrapSetup(levelBudget=[4,4], slots=slots).
-  The precomputed tables this builds are NOT serialized with the CryptoContext.
-  After deserialization the server must replay the EXACT same call — same
-  levelBudget AND same slots value — or EvalBootstrap() crashes with
-  "KeySwitchDown(): Input ciphertext is nullptr".
-  We send bootstrap_level_budget=[4,4] in the train payload so the serializer
-  can do this replay automatically in recv_train_payload().
 """
 
 from __future__ import annotations
@@ -65,10 +60,11 @@ from client_server.client.client_keys import (
 )
 from client_server.client.metrics import MetricsRecorder
 from client_server.client.utils import (
-    build_edge_batch,
+    build_line_graph,
+    build_line_graph_batch,
     compute_classification_metrics,
-    derive_node_labels_from_edges,
     load_iot_edge_train_test,
+    make_connected_batches,
 )
 from client_server.server.utils import write_metrics_csv as write_server_metrics_csv
 
@@ -311,13 +307,13 @@ def main() -> None:
     import numpy as np
 
     parser = argparse.ArgumentParser(
-        description="IoT Malicious Node Prediction (FHE client, CKKS-only)"
+        description="IoT Malicious Edge (Link) Prediction (FHE GAT, CKKS-only, line-graph)"
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=60,
-        help="Graph nodes per training batch to send to the FHE server. ",
+        help="Line-graph nodes (original edges) per training/inference batch.",
     )
     parser.add_argument(
         "--epochs", type=int, default=3, help="Training epochs (default 3)"
@@ -335,7 +331,7 @@ def main() -> None:
         "--test_ratio",
         type=float,
         default=0.2,
-        help="Fraction of nodes for test set (default 0.2)",
+        help="Fraction of edges for test set (default 0.2)",
     )
     parser.add_argument(
         "--seed",
@@ -388,16 +384,22 @@ def main() -> None:
         help="Run inference only (requires --load_weights). Skip all training steps.",
     )
     parser.add_argument(
-        "--max_edges",
+        "--max_rows_dataset",
         type=int,
         default=None,
-        help="Cap number of edges for quick runs (edge mode only).",
+        help="Cap number of CSV rows (edges) for quick runs.",
+    )
+    parser.add_argument(
+        "--max_degree_batch",
+        type=int,
+        default=10,
+        metavar="K",
+        help="Cap in-degree per node in each batch (max edges = batch_size*K). Default 10 for FHE memory; use 8--15 for 8GB RAM.",
     )
     args = parser.parse_args()
 
-    # Edge-based: node_in_dim=2 (in/out degree), hidden_dim=8
-    F_in, F_out, slots = 2, 8, 8
-    EDGE_FEAT_DIM = 3
+    # Line-graph: node features = edge features (3), one logit per node = per original edge
+    F_in, F_out, slots = 3, 1, 8
 
     ts = time.strftime("%Y%m%d_%H%M%S")
     client_metrics_path = f"client_fhe_metrics_{ts}.csv"
@@ -408,15 +410,17 @@ def main() -> None:
     print("IoT Malicious Edge (Link) Prediction (FHE GAT, CKKS-only)")
     print(
         f"  batch_size={args.batch_size}  epochs={args.epochs}  "
-        f"lr={args.lr}  test_ratio={args.test_ratio}  max_edges={args.max_edges or 'ALL'}"
+        f"lr={args.lr}  test_ratio={args.test_ratio}  max_rows_dataset={args.max_rows_dataset or 'ALL'}"
     )
+    if args.max_degree_batch is not None:
+        print(f"  max_degree_batch={args.max_degree_batch} (cap edges per batch for memory)")
     if args.host:
         print(f"  Transport: TCP  {args.host}:{args.port}")
     else:
         print("  Transport: in-process (no network)")
     print("=" * 60)
 
-    # 1. Load edge-based data (one row = one edge, label per edge)
+    # 1. Load edge-based data and build line graph (one node per edge)
     print("\n1. Loading IoT edge train + test...")
     (
         x_nodes,
@@ -430,18 +434,27 @@ def main() -> None:
         path=args.data,
         test_ratio=args.test_ratio,
         seed=args.seed,
-        max_edges=args.max_edges,
+        max_rows_dataset=args.max_rows_dataset,
     )
     n_train_edges = len(train_edge_ids)
     n_test_edges = len(test_edge_ids)
-    n_batches_train = max(1, (n_train_edges + args.batch_size - 1) // args.batch_size)
-    n_batches_test = max(1, (n_test_edges + args.batch_size - 1) // args.batch_size)
+    print("   Building line graph (one node per edge)...")
+    x_line, edge_index_line, y_line = build_line_graph(
+        edge_index_full, edge_feats, edge_labels
+    )
+    train_line_ids = train_edge_ids
+    test_line_ids = test_edge_ids
+    # Connected batches: BFS-grown subgraphs (fewer edges per batch than contiguous chunks)
+    train_batches = make_connected_batches(train_line_ids, edge_index_line, args.batch_size)
+    test_batches = make_connected_batches(test_line_ids, edge_index_line, args.batch_size)
+    n_batches_train = len(train_batches)
+    n_batches_test = len(test_batches)
     print(
-        f"   Nodes={N_total}, Train edges={n_train_edges}, Test edges={n_test_edges}"
+        f"   Line graph nodes={x_line.shape[0]}, Train={n_train_edges}, Test={n_test_edges}"
     )
     print(
         f"   Batches train={n_batches_train}, test={n_batches_test} "
-        f"(batch_size={args.batch_size} edges)"
+        f"(batch_size={args.batch_size} line-graph nodes, connected)"
     )
 
     client_metrics = MetricsRecorder()
@@ -479,16 +492,11 @@ def main() -> None:
         F_in = w["F_in"]
         F_out = w["F_out"]
 
-        edge_head_weight = np.asarray(w["edge_head_weight"], dtype=np.float64) if w.get("edge_head_weight") is not None else None
-        edge_head_bias = np.asarray(w["edge_head_bias"], dtype=np.float64) if w.get("edge_head_bias") is not None else None
-
         server_train_metrics_list = []
 
         print(
             f"   Loaded {len(ct_W_trained)} weight ciphertext(s). Skipping training."
         )
-        if edge_head_weight is not None:
-            print("   Loaded edge head weights for inference.")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  BRANCH B: normal path — generate keys, encrypt, run mini-batch training
@@ -525,92 +533,90 @@ def main() -> None:
 
         ct_W_trained = ct_W_list
         server_train_metrics_list = []
-        edge_head_weight, edge_head_bias = None, None
 
-        # Batches are disjoint: shuffle train edge indices once, then slice [0:batch_size], ...
         rng = np.random.default_rng(args.seed)
-        shuffled_train_ids = rng.permutation(train_edge_ids)
+        train_batches_shuffled = [list(b) for b in train_batches]
+        rng.shuffle(train_batches_shuffled)
         for b_idx in range(n_batches_train):
-                start = b_idx * args.batch_size
-                end = min(start + args.batch_size, n_train_edges)
-                batch_edge_ids = shuffled_train_ids[start:end]  # disjoint from other batches
-                # Each batch gets a disjoint slice of shuffled train edges (no overlap)
-                edge_ids_min, edge_ids_max = int(batch_edge_ids.min()), int(batch_edge_ids.max())
-                x_batch, edge_index_batch, edge_feats_batch, y_edges_batch, _ = build_edge_batch(
-                    batch_edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes,
-                )
-                if edge_index_batch.shape[1] == 0:
-                    continue
-                num_nodes_batch = x_batch.shape[0]
-                node_labels_batch = derive_node_labels_from_edges(
-                    edge_index_batch, y_edges_batch, num_nodes_batch,
-                )
-                print(
-                    f"\n   Batch {b_idx+1}/{n_batches_train} "
-                    f"(edges={len(batch_edge_ids)}, nodes={num_nodes_batch}) "
-                    f"edge_ids=[{edge_ids_min}..{edge_ids_max}]"
-                )
-                with client_metrics.step(f"encrypt_train_batch_{b_idx}", encrypted=True):
-                    ct_x_batch = client_ctx.encrypt_node_features(x_batch, F_in)
-                    ct_labels_batch = [
-                        client_ctx.crypto_context.Encrypt(
-                            client_ctx.keys.publicKey,
-                            client_ctx.crypto_context.MakeCKKSPackedPlaintext(
-                                [float(y)] * slots
-                            ),
-                        )
-                        for y in node_labels_batch
-                    ]
-                gradient_step_payload = {
-                    "crypto_context": client_ctx.crypto_context,
-                    "public_key": client_ctx.keys.publicKey,
-                    "in_channels": F_in,
-                    "out_channels": F_out,
-                    "slots": slots,
-                    "ct_W_list": ct_W_trained,
-                    "a": a,
-                    "negative_slope": 0.2,
-                    "num_nodes": num_nodes_batch,
-                    "edge_index": edge_index_batch,
-                    "node_features_enc": ct_x_batch,
-                    "ct_labels": ct_labels_batch,
-                    "lr": args.lr,
-                    "num_epochs": args.epochs,
-                }
-                if args.host:
-                    ct_W_trained, batch_metrics = run_tcp_gradient_step(
-                        args.host, args.port, gradient_step_payload
-                    )
-                else:
-                    from client_server.server.server import compute_fhe_training_batch
-                    ct_W_trained, batch_metrics = compute_fhe_training_batch(
-                        crypto_context=gradient_step_payload["crypto_context"],
-                        public_key=gradient_step_payload["public_key"],
-                        in_channels=gradient_step_payload["in_channels"],
-                        out_channels=gradient_step_payload["out_channels"],
-                        slots=gradient_step_payload["slots"],
-                        ct_W_list=gradient_step_payload["ct_W_list"],
-                        a=gradient_step_payload["a"],
-                        negative_slope=gradient_step_payload["negative_slope"],
-                        num_nodes=gradient_step_payload["num_nodes"],
-                        edge_index=gradient_step_payload["edge_index"],
-                        node_features_enc=gradient_step_payload["node_features_enc"],
-                        ct_labels=gradient_step_payload["ct_labels"],
-                        lr=gradient_step_payload["lr"],
-                        num_epochs=gradient_step_payload["num_epochs"],
-                    )
-                server_train_metrics_list.append(batch_metrics)
-                batch_time = sum(step.get("seconds", 0.0) for step in batch_metrics.values())
-                print(f"      Local epochs={args.epochs}  server_time={batch_time:.4f}s")
+            batch_line_ids = np.asarray(train_batches_shuffled[b_idx], dtype=np.int64)
 
-    # ---- Aggregate training metrics (both branches) ----
+            x_batch, edge_index_batch, y_batch, target_indices = build_line_graph_batch(
+                batch_line_ids, edge_index_line, x_line, y_line,
+                max_degree_per_node=args.max_degree_batch,
+            )
+            if x_batch.shape[0] == 0:
+                continue
+            num_nodes_batch = x_batch.shape[0]
+            train_mask = np.zeros(num_nodes_batch, dtype=bool)
+            train_mask[target_indices] = True
+
+            print(
+                f"\n   Batch {b_idx+1}/{n_batches_train} "
+                f"(line-graph nodes={len(batch_line_ids)}, edges in line-graph nodes={edge_index_batch.shape[1]})"
+            )
+            with client_metrics.step(f"encrypt_train_batch_{b_idx}", encrypted=True):
+                ct_x_batch = client_ctx.encrypt_node_features(x_batch, F_in)
+                ct_labels_batch = [
+                    client_ctx.crypto_context.Encrypt(
+                        client_ctx.keys.publicKey,
+                        client_ctx.crypto_context.MakeCKKSPackedPlaintext(
+                            [float(y)] * slots
+                        ),
+                    )
+                    for y in y_batch
+                ]
+            gradient_step_payload = {
+                "crypto_context": client_ctx.crypto_context,
+                "public_key": client_ctx.keys.publicKey,
+                "in_channels": F_in,
+                "out_channels": F_out,
+                "slots": slots,
+                "ct_W_list": ct_W_trained,
+                "a": a,
+                "negative_slope": 0.2,
+                "num_nodes": num_nodes_batch,
+                "edge_index": edge_index_batch,
+                "node_features_enc": ct_x_batch,
+                "ct_labels": ct_labels_batch,
+                "train_mask": train_mask,
+                "lr": args.lr,
+                "num_epochs": args.epochs,
+            }
+            if args.host:
+                ct_W_trained, batch_metrics = run_tcp_gradient_step(
+                    args.host, args.port, gradient_step_payload
+                )
+            else:
+                from client_server.server.server import compute_fhe_training_batch
+                ct_W_trained, batch_metrics = compute_fhe_training_batch(
+                    crypto_context=gradient_step_payload["crypto_context"],
+                    public_key=gradient_step_payload["public_key"],
+                    in_channels=gradient_step_payload["in_channels"],
+                    out_channels=gradient_step_payload["out_channels"],
+                    slots=gradient_step_payload["slots"],
+                    ct_W_list=gradient_step_payload["ct_W_list"],
+                    a=gradient_step_payload["a"],
+                    negative_slope=gradient_step_payload["negative_slope"],
+                    num_nodes=gradient_step_payload["num_nodes"],
+                    edge_index=gradient_step_payload["edge_index"],
+                    node_features_enc=gradient_step_payload["node_features_enc"],
+                    ct_labels=gradient_step_payload["ct_labels"],
+                    train_mask=gradient_step_payload["train_mask"],
+                    lr=gradient_step_payload["lr"],
+                    num_epochs=gradient_step_payload["num_epochs"],
+                )
+            server_train_metrics_list.append(batch_metrics)
+            batch_time = sum(step.get("seconds", 0.0) for step in batch_metrics.values())
+            print(f"      Local epochs={args.epochs}  server_time={batch_time:.4f}s")
+
+    # ---- Write server training metrics (in-process only; when TCP, server writes to its CWD) ----
     aggregated_train_metrics = {}
     for idx, batch_m in enumerate(server_train_metrics_list):
         for name, step in batch_m.items():
             key = f"batch_{idx}_{name}"
             aggregated_train_metrics[key] = step
 
-    if aggregated_train_metrics:
+    if not args.host and aggregated_train_metrics:
         write_server_metrics_csv(server_train_metrics_path, aggregated_train_metrics)
     # Decrypt weight ciphertexts → numpy matrix (F_out, F_in)
     W_rows = []
@@ -622,90 +628,21 @@ def main() -> None:
     W_trained = np.array(W_rows, dtype=np.float64)
     a_trained = a
 
-    # ── Edge head: train on client from FHE embeddings (fresh training only)
-    if not args.load_weights:
-        print("\n   Training edge head on client (FHE GAT embeddings)...")
-        rng_eh = np.random.default_rng(args.seed)
-        shuffled_train_ids_eh = rng_eh.permutation(train_edge_ids)
-        X_emb_list, y_emb_list = [], []
-        for b_idx in range(n_batches_train):
-            start = b_idx * args.batch_size
-            end = min(start + args.batch_size, n_train_edges)
-            batch_edge_ids = shuffled_train_ids_eh[start:end]
-            x_batch, edge_index_batch, edge_feats_batch, y_edges_batch, _ = build_edge_batch(
-                batch_edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes,
-            )
-            if edge_index_batch.shape[1] == 0:
-                continue
-            ct_x_batch = client_ctx.encrypt_node_features(x_batch, F_in)
-            infer_payload = {
-                "crypto_context": client_ctx.crypto_context,
-                "public_key": client_ctx.keys.publicKey,
-                "in_channels": F_in,
-                "out_channels": F_out,
-                "slots": slots,
-                "ct_W_list": ct_W_trained,
-                "a": a_trained,
-                "negative_slope": 0.2,
-                "num_nodes": x_batch.shape[0],
-                "edge_index": edge_index_batch,
-                "node_features_enc": ct_x_batch,
-                "print_metrics": False,
-            }
-            if args.host:
-                out_cts, _ = run_tcp_infer(args.host, args.port, infer_payload)
-            else:
-                out_cts, _ = run_infer_inprocess(
-                    client_ctx, F_in, F_out, slots,
-                    x_batch.shape[0], edge_index_batch, ct_x_batch,
-                    ct_W_trained, a_trained,
-                )
-            output = client_ctx.decrypt_node_features(out_cts, F_out)
-            for e in range(edge_index_batch.shape[1]):
-                src, dst = int(edge_index_batch[0, e]), int(edge_index_batch[1, e])
-                row = np.concatenate([
-                    output[src], output[dst], edge_feats_batch[e].ravel(),
-                ])
-                X_emb_list.append(row)
-                y_emb_list.append(y_edges_batch[e])
-        X_emb = np.array(X_emb_list, dtype=np.float64)
-        y_emb = np.array(y_emb_list, dtype=np.int64)
-        try:
-            from sklearn.linear_model import LogisticRegression
-            clf = LogisticRegression(max_iter=500, solver="lbfgs")
-            clf.fit(X_emb, y_emb)
-            edge_head_weight = np.asarray(clf.coef_, dtype=np.float64)
-            edge_head_bias = np.asarray(clf.intercept_, dtype=np.float64)
-        except Exception as e:
-            print(f"   [WARNING] Edge head fit failed ({e}); using zero head.")
-            edge_head_weight = np.zeros((1, 2 * F_out + EDGE_FEAT_DIM), dtype=np.float64)
-            edge_head_bias = np.zeros(1, dtype=np.float64)
-        print(f"   Edge head fitted on {len(y_emb)} train edges.")
-
-    # Fallback zero edge head when loading old weights without edge head
-    if edge_head_weight is None and args.load_weights:
-        edge_head_weight = np.zeros((1, 2 * F_out + EDGE_FEAT_DIM), dtype=np.float64)
-        edge_head_bias = np.zeros(1, dtype=np.float64)
-
     # ── Save trained weights (only after fresh training, not when loading) ───
     if not args.load_weights:
         print(f"\n[weights] Saving trained weights → {weights_save_dir} ...")
         from client_server.openfhe_serializer import save_trained_weights
 
-        save_kw = dict(
+        save_trained_weights(
+            weights_save_dir,
             W_list=W_trained,
             a=a_trained,
             slots=slots,
             F_in=F_in,
             F_out=F_out,
         )
-        if edge_head_weight is not None:
-            save_kw["edge_head_weight"] = edge_head_weight
-            save_kw["edge_head_bias"] = edge_head_bias
-        save_trained_weights(weights_save_dir, **save_kw)
         print(
-            f"   Weights saved.  Re-run with --load_weights {weights_save_dir} "
-            "to skip training next time."
+            f"   Weights saved.  Re-run with --load_weights {weights_save_dir} to skip training next time."
         )
 
     # ── train_only mode: exit after training ──────────────────────────────────
@@ -724,17 +661,16 @@ def main() -> None:
     server_infer_metrics_list: list[dict] = []
     batch_csv_rows = []
 
-    # Edge-based inference: batches of test edges, decrypt node embeddings, apply edge head
-    print("\n5. Client: encrypting test edge batches for inference...")
-    print(f"\n6. Server: batched FHE inference over {n_test_edges} test edges...")
+    # Line-graph inference: batch test line-graph nodes, decrypt; logits at target_indices = edge predictions
+    print("\n5. Client: encrypting test line-graph batches for inference...")
+    print(f"\n6. Server: batched FHE inference over {n_test_edges} test edges (line-graph nodes)...")
     for b_idx in range(n_batches_test):
-        start = b_idx * args.batch_size
-        end = min(start + args.batch_size, n_test_edges)
-        batch_edge_ids = test_edge_ids[start:end]
-        x_batch, edge_index_batch, edge_feats_batch, y_edges_batch, _ = build_edge_batch(
-            batch_edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes,
+        batch_line_ids = np.asarray(test_batches[b_idx], dtype=np.int64)
+        x_batch, edge_index_batch, y_batch, target_indices = build_line_graph_batch(
+            batch_line_ids, edge_index_line, x_line, y_line,
+            max_degree_per_node=args.max_degree_batch,
         )
-        if edge_index_batch.shape[1] == 0:
+        if x_batch.shape[0] == 0:
             continue
         with client_metrics.step(f"encrypt_batch_{b_idx}", encrypted=True):
             _t0 = time.perf_counter()
@@ -769,15 +705,11 @@ def main() -> None:
             _t0 = time.perf_counter()
             output = client_ctx.decrypt_node_features(out_cts, F_out)
             decryption_time = time.perf_counter() - _t0
-        # Edge logits: for each edge (src, dst), logit = edge_head @ [h_src; h_dst; edge_feats]
-        for e in range(edge_index_batch.shape[1]):
-            src, dst = int(edge_index_batch[0, e]), int(edge_index_batch[1, e])
-            feat = np.concatenate([
-                output[src], output[dst], edge_feats_batch[e].ravel(),
-            ])
-            logit = float(np.dot(edge_head_weight.ravel(), feat) + edge_head_bias.ravel()[0])
-            all_scores.append(logit)
-            all_labels.append(int(y_edges_batch[e]))
+        # One logit per line-graph node; take only target nodes (batch of original edges)
+        logits_batch = output[target_indices, 0] if output.ndim > 1 else output[target_indices]
+        for i in range(len(target_indices)):
+            all_scores.append(float(logits_batch[i]))
+            all_labels.append(int(y_batch[target_indices[i]]))
         del out_cts, ct_x_batch
         server_time_seconds = sum(m.get("seconds", 0.0) for m in (batch_metrics or {}).values())
         max_rss = max((m.get("rss_after_bytes", 0) for m in (batch_metrics or {}).values()), default=0)
@@ -785,7 +717,7 @@ def main() -> None:
         server_rss_delta = sum(m.get("rss_delta_bytes", 0) for m in (batch_metrics or {}).values())
         server_power = server_energy_joules / server_time_seconds if server_time_seconds > 0 else 0.0
         client_time_batch = encryption_time + decryption_time
-        throughput = (len(batch_edge_ids) / (server_time_seconds + client_time_batch)) if (server_time_seconds + client_time_batch) > 0 else 0.0
+        throughput = (len(batch_line_ids) / (server_time_seconds + client_time_batch)) if (server_time_seconds + client_time_batch) > 0 else 0.0
         batch_csv_rows.append({
             "step": f"fhe_batch_{b_idx}",
             "server_time": server_time_seconds,
@@ -797,7 +729,7 @@ def main() -> None:
             "throughput": round(throughput, 6),
             "batch": b_idx,
             "nodes_in_batch": x_batch.shape[0],
-            "edges_in_batch": len(batch_edge_ids),
+            "edges_in_batch": len(batch_line_ids),
             "client_encryption_time": encryption_time,
             "client_decryption_time": decryption_time,
             "ciphertext_size_bytes": total_batch_size_bytes,
@@ -807,14 +739,13 @@ def main() -> None:
         })
         server_infer_metrics_list.append(batch_metrics or {})
 
-    # ---- Write server infer metrics to CSV (standard: rss_after_bytes, rss_delta_bytes, power_watts, energy_joules, throughput) ----
-    if server_infer_metrics_list:
+    # ---- Write server infer metrics (in-process only; when TCP, server writes to its CWD) ----
+    if not args.host and server_infer_metrics_list:
         infer_rows = []
         for i, batch_m in enumerate(server_infer_metrics_list):
             for name, m in batch_m.items():
                 infer_rows.append({"phase": f"infer_batch_{i}_{name}", **m})
         write_server_metrics_csv(server_infer_metrics_path, infer_rows)
-        print(f"[client] Server infer metrics written → {server_infer_metrics_path}")
 
     # ---- Write batch metrics to CSV ----
     import csv

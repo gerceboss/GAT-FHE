@@ -1,11 +1,11 @@
 # GAT Client–Server — Plaintext & CKKS FHE
 
-A **Graph Attention Network (GAT)** plus **edge head** for **IoT malicious edge (link) detection**: one CSV row = one **edge** (one communication), label **per edge** (benign vs malicious). Implemented in two modes:
+A **Graph Attention Network (GAT)** for **IoT malicious edge (link) detection**: one CSV row = one **edge** (one communication), label **per edge** (benign vs malicious). We use the **line graph (dual graph)** so that features live on nodes; **node-based GAT only** (no edge head). Implemented in two modes:
 
-- **Plaintext Baseline** — PyTorch GAT + edge head, no encryption
-- **CKKS FHE Secure Version** — OpenFHE; server runs GAT on ciphertexts; client decrypts and runs edge head (or loads pre-fitted edge head)
+- **Plaintext Baseline** — PyTorch GAT on line-graph nodes, no encryption
+- **CKKS FHE Secure Version** — OpenFHE; server runs node-level GAT on ciphertexts; client decrypts node logits (one per original edge)
 
-Both modes use the same edge-based data and batching (e.g. 60 edges per batch). Three deployment options: in-process, two terminals (same machine), or two systems on a LAN.
+Both modes build the line graph once, then use the same batching (e.g. 60 line-graph nodes per batch). Three deployment options: in-process, two terminals (same machine), or two systems on a LAN.
 
 ---
 
@@ -54,65 +54,60 @@ Place dataset at:
 client_server/client/iot.csv
 ```
 
-### Dataset: iot.csv — 6 columns (edge-based)
+### Dataset: iot.csv — 6 columns (one row = one edge)
 
 The CSV must have **6 columns**: **src_ip**, **dst_ip**, **src_bytes**, **dst_bytes**, **duration**, **label**. Each **row is one edge** (one communication).
 
 | Column       | Role |
 | ------------ | -----|
-| **src_ip**   | Source node (graph); unique IPs become node IDs |
-| **dst_ip**   | Destination node (graph) |
-| **src_bytes**| Edge feature (per row); StandardScaler-normalised |
-| **dst_bytes**| Edge feature (per row); StandardScaler-normalised |
-| **duration** | Edge feature (per row); StandardScaler-normalised |
-| **label**    | **Edge label** (0/1): target for training and evaluation; not an input feature |
+| **src_ip**   | Source node (original graph); unique IPs become node IDs |
+| **dst_ip**   | Destination node (original graph) |
+| **src_bytes**| Feature (per row); becomes line-graph node feature; StandardScaler-normalised |
+| **dst_bytes**| Feature (per row); line-graph node feature; StandardScaler-normalised |
+| **duration** | Feature (per row); line-graph node feature; StandardScaler-normalised |
+| **label**    | **Edge label** (0/1): target for training and evaluation; becomes line-graph node label |
 
-**Node features** (for GAT): structural only — **in-degree** and **out-degree** (2 dims), StandardScaler-normalised. **Edge features** (for edge head): **src_bytes**, **dst_bytes**, **duration** (3 dims). Train/test split is **by edge index** (e.g. 80% edges train, 20% test). Batches are **edge batches** (e.g. 60 edges per batch); `build_edge_batch()` builds the subgraph of nodes involved in those edges and the local edge index and edge features/labels.
-
----
-
-# PART 1 — Plaintext GAT + Edge Head (Baseline)
+We build the **line graph** once: one node per edge, node features = (src_bytes, dst_bytes, duration), node label = edge label. Train/test split is **by edge index** (e.g. 80% train, 20% test). Batches are **line-graph node batches** (e.g. 60 nodes per batch); `build_line_graph_batch()` returns the batch subgraph (batch nodes only, no neighbour expansion) and `target_indices` for train_mask / prediction.
 
 ---
 
-## Why the Edge Head? Why a Second Layer for Prediction?
-
-The GAT layer is **node-level**: it takes node features and the graph and outputs **one embedding vector per node**. It does **not** output a score per edge. For **edge (link) prediction** we need **one scalar per edge** (e.g. “is this communication malicious?”).
-
-So we add an **edge head** — a second, small computation that turns **pairs of node embeddings** (and edge features) into **one score per edge**:
-
-- **Input**: For each edge `(src, dst)` we have GAT embeddings `h_src`, `h_dst` and edge features (e.g. src_bytes, dst_bytes, duration).
-- **Computation**: One linear layer: `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge`.
-- **Output**: One logit per edge → sigmoid for probability, then threshold for class.
-
-So the “second layer” is not another GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. The plaintext server runs both GAT and edge head (`PlainGATModelEdge`). In the FHE path, the server runs only the GAT (encrypted); the client decrypts node embeddings and runs the edge head in plaintext.
+# PART 1 — Plaintext GAT (Line-Graph, Node-Based)
 
 ---
 
-## Architecture Overview (Plaintext, Edge-Based)
+## Line graph (dual graph): node-based GAT only
+
+We use a **line graph (dual graph)**: each original edge becomes a **node** in the line graph, and its features live on that node. The GAT runs directly on these line-graph nodes and produces **one logit per node = one logit per original edge**, so no separate edge head is required.
+
+---
+
+## Architecture Overview (Plaintext, Line-Graph Node-Based)
 
 ```
 plain_client.py                          plain_server.py
 ────────────────                         ───────────────────────────
 load_iot_edge_train_test()
-build_edge_batch()  (per edge batch)
+build_line_graph()         (original edges → line-graph nodes)
 
 ── TRAINING ──
-for each edge batch:
-  build x_batch, edge_index_batch,     ──b"G"──▶  compute_plain_training_batch_edge()
-  edge_feats_batch, y_edges_batch                 ├─ PlainGATModelEdge: GAT + edge head
-  send {x, edges, edge_feats, y_edges,            ├─ BCEWithLogitsLoss (edge labels)
-        W, a, edge_head_weight, edge_head_bias,   ├─ Adam.step() × num_epochs
-        num_epochs, lr}                            └─ per-epoch: loss, acc, time, RSS
-  recv W_new, a_new, edge_W_new,       ◀──────────
-       edge_b_new, metrics_rows
+for each batch of line-graph nodes:
+  build subgraph via build_line_graph_batch()
+  send {x_batch, edge_index_batch,
+        y_batch, train_mask, W, a,
+        num_epochs, lr}               ──b"G"──▶  compute_plain_training_batch()
+                                               ├─ GAT (node-level) with train_mask
+                                               └─ per-epoch: loss, acc, time, RSS
+  recv W_new, a_new, metrics_rows     ◀──────────
 
 ── INFERENCE ──
-for each test edge batch:
-  build x_batch, edge_index_batch,     ──b"I"──▶  compute_plain_infer_batch_edge()
-  edge_feats_batch                             └─ PlainGATModelEdge.forward() → edge logits
-  send {x, edges, edge_feats, W, a, edge_head_*}
-  recv logits (per edge), batch_metrics ◀──────────
+for each test batch of line-graph nodes:
+  build subgraph via build_line_graph_batch()
+  send {x_batch, edge_index_batch,
+        node_indices=target_indices,
+        W, a}                         ──b"I"──▶  compute_plain_infer_batch()
+                                               └─ logits for all subgraph nodes
+  recv logits_all, batch_metrics      ◀──────────
+  keep logits[target_indices] as edge logits
 
 compute_classification_metrics()  (on edge labels)
 write plain_batch_metrics_<ts>.csv, plain_summary_<ts>.csv
@@ -127,21 +122,16 @@ write plain_batch_metrics_<ts>.csv, plain_summary_<ts>.csv
 | `--infer_only`    | Load saved weights, run inference — skip training  |
 | `--load_weights`  | Skip training, use saved `plain_weights.pt`        |
 
-### Batch construction and how subgraphs are built (edge-based)
+### Batch construction (line-graph, node-based)
+
+**Line graph**  
+Built once: `build_line_graph(edge_index_full, edge_feats, edge_labels)` → one node per original edge, node features = edge features, node labels = edge labels.
 
 **Training batches**  
-Train **edges** are shuffled, then split into contiguous chunks of `--batch_size` **edges** (e.g. 60). Each chunk is one batch. No overlap: each edge appears in exactly one batch.
+Train **line-graph node IDs** (same as train edge IDs) are shuffled, then split into chunks of `--batch_size`. For each chunk, `build_line_graph_batch(batch_line_ids, edge_index_line, x_line, y_line)` returns a **batch subgraph** (batch nodes only; edges only between those nodes) with local `x_batch`, `edge_index_batch`, `y_batch`, and `target_indices`. Only nodes at `target_indices` get `train_mask=True`. GAT is node-level; one logit per node = per original edge.
 
-**Subgraph for each batch** — `build_edge_batch(edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes)`:
-
-1. Take the edges in this batch: `edge_index_full[:, edge_ids]`.
-2. Collect all **node IDs** that appear in those edges (source or target).
-3. Build **local** node features `x_batch = x_nodes[nodes_global]` and **local** edge index (remapping global node IDs to 0..num_nodes_batch-1).
-4. Slice edge features and edge labels for this batch.
-
-So each batch is a **small induced subgraph**: only the nodes that appear in the batch’s edges, plus the batch’s edges with local indices. GAT runs on this subgraph; the edge head gets one logit per edge in the batch.
-
-**Inference batches**: Same idea: test edges are split into chunks of `batch_size` edges; for each chunk we call `build_edge_batch()` and send the subgraph + edge features; server returns **edge logits** (one per edge in the batch).
+**Inference batches**  
+Same idea: test line-graph nodes in chunks; `build_line_graph_batch()`; server returns node logits; client keeps `logits[target_indices]` as predictions per original edge.
 
 ---
 
@@ -159,8 +149,8 @@ python -m client_server.client.plain_client \
 Useful options:
 
 ```bash
---max_edges 5000    # cap number of edges for quick runs
---seed 42           # reproducible split
+--max_rows_dataset 5000    # cap number of CSV rows (edges) for quick runs
+--seed 42                  # reproducible split
 ```
 
 ---
@@ -327,13 +317,13 @@ throughput_nodes_per_sec,<value>
 
 ---
 
-# PART 2 — CKKS FHE Secure GAT (Edge-Based)
+# PART 2 — CKKS FHE Secure GAT (Line-Graph, Node-Based)
 
 ---
 
-## Architecture Overview (FHE, Edge-Based)
+## Architecture Overview (FHE, Line-Graph)
 
-The fundamental security property is that **the server never holds the secret key** and therefore never sees any plaintext — not features, not labels, not weights. The pipeline is **edge-based**: batches are **edge batches**; labels are **per edge**. The server runs only the **GAT** (encrypted); the **edge head** runs on the **client** after decryption (node embeddings → edge logits).
+The fundamental security property is that **the server never holds the secret key** and therefore never sees any plaintext — not features, not labels, not weights. The pipeline uses the **line graph**: batches are **line-graph node batches**; labels are **per node** (= per original edge). The server runs only **node-level GAT** (encrypted); the client decrypts **node logits** (one per original edge). No edge head.
 
 ```
 client.py  (holds secret key)           server.py  (stateless compute)
@@ -345,29 +335,27 @@ create_client_context()
   └─ EvalRotKeyGen(sk, rotations)       
   └─ EvalBootstrapSetup(levelBudget)    
 
-encrypt_weight_matrix(W_init, F_in)     F_in=2 (node), F_out=8 (embedding dim)
+encrypt_weight_matrix(W_init, F_in)     F_in=3 (line-graph node), F_out=1 (one logit per node)
   → ct_W_list  (one ct per output row)  
 encrypt_node_features(x_batch, F_in)    
   → ct_x_batch (one ct per node)        
 
-── TRAINING (b"G" per edge batch) ──
-  Derive node labels from edge labels (per batch)
+── TRAINING (b"G" per line-graph batch) ──
+  build_line_graph_batch → x_batch, edge_index_batch, y_batch, target_indices; train_mask at target_indices
 send {cc, pk, ct_W_list, a,     ──▶     compute_fhe_training_batch()
-      ct_x, ct_labels (node-derived),   ├─ GATEncoderCKKS.forward()
-      edge_index, num_epochs, lr}        ├─ FHE linear, attention, softmax, aggregation
-recv ct_W_list_new, metrics     ◀──     ├─ Encrypted gradient + Adam step
+      ct_x, ct_labels, train_mask,     ├─ GATEncoderCKKS.forward() (node-level)
+      edge_index, num_epochs, lr}       ├─ FHE linear, attention, softmax, aggregation
+recv ct_W_list_new, metrics     ◀──     ├─ Encrypted gradient + Adam step (loss on train_mask nodes only)
                                          └─ EvalBootstrap(ct_W) if level low
-  After all batches: decrypt W. Then train edge head on client (FHE forward on
-  train batches → decrypt embeddings → fit LogisticRegression on [h_src; h_dst; edge_feats]).
+  No edge head: GAT output is one logit per node (= per original edge).
 
-── INFERENCE (b"I" per edge batch) ──
+── INFERENCE (b"I" per line-graph batch) ──
 send {cc, pk, ct_W_list, a,     ──▶     compute_forward_only()
-      ct_x, edge_index}                   ├─ full GAT forward pass (node embeddings)
-recv ct_out (node embeddings),   ◀──     └─ EvalBootstrap(out_cts) if level low
+      ct_x, edge_index}                   ├─ full GAT forward pass (node logits)
+recv ct_out (node logits),       ◀──     └─ EvalBootstrap(out_cts) if level low
       metrics
 
-Decrypt(sk, ct_out) → node embeddings (N_batch, F_out)
-For each edge (src,dst): logit = edge_head @ [h_src; h_dst; edge_feats]
+Decrypt(sk, ct_out) → node logits (N_batch, 1). Take logits[target_indices] as per-edge predictions.
 compute_classification_metrics()  (on edge labels)
 write fhe_batch_metrics_<ts>.csv, fhe_summary_<ts>.csv
 ```
@@ -761,8 +749,8 @@ Status byte convention (server → client):
 --batch_size 60
 --batch_size 120
 
-# Cap edges for quick runs
---max_edges 5000
+# Cap edges for quick runs by limiting CSV rows
+--max_rows_dataset 5000
 
 # Vary training depth
 --epochs 3

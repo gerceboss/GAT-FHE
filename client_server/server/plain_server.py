@@ -153,85 +153,52 @@ class PlainGATLayer(nn.Module):
         return out
 
 
-class PlainGATModelEdge(nn.Module):
+class PlainGATModel(nn.Module):
     """
-    GAT + edge classifier head for link/edge prediction.
-    Node features -> GAT -> node embeddings; then edge logits = MLP(concat(h_src, h_dst, edge_feats)).
+    Node-level GAT (single layer). Used for line graph: each node = one original edge,
+    so one logit per node = one prediction per original edge. No edge head.
     """
-    def __init__(
-        self,
-        node_in_dim: int,
-        hidden_dim: int,
-        edge_feat_dim: int,
-        negative_slope: float = 0.2,
-    ):
+    def __init__(self, in_channels: int, out_channels: int, negative_slope: float = 0.2):
         super().__init__()
-        self.node_in_dim = node_in_dim
-        self.hidden_dim = hidden_dim
-        self.edge_feat_dim = edge_feat_dim
-        self.gat = PlainGATLayer(node_in_dim, hidden_dim, negative_slope)
-        self.edge_head = nn.Linear(2 * hidden_dim + edge_feat_dim, 1)
+        self.gat = PlainGATLayer(in_channels, out_channels, negative_slope)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_feats: torch.Tensor,
-    ) -> torch.Tensor:
-        h = self.gat(x, edge_index)  # (N, hidden_dim)
-        src, dst = edge_index[0], edge_index[1]
-        edge_repr = torch.cat([h[src], h[dst], edge_feats], dim=-1)  # (E, 2*hidden + edge_feat)
-        return self.edge_head(edge_repr).squeeze(-1)  # (E,)
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        return self.gat(x, edge_index)  # (N, out_channels)
 
-    def load_weights(
-        self,
-        W_np: np.ndarray,
-        a_np: np.ndarray,
-        edge_W_np: np.ndarray,
-        edge_b_np: np.ndarray,
-    ) -> None:
+    def load_weights(self, W_np: np.ndarray, a_np: np.ndarray) -> None:
         self.gat.load_weights(W_np, a_np)
-        with torch.no_grad():
-            self.edge_head.weight.copy_(torch.tensor(edge_W_np, dtype=torch.float32))
-            self.edge_head.bias.copy_(torch.tensor(edge_b_np, dtype=torch.float32))
 
-    def get_weights(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        W, a = self.gat.get_weights()
-        edge_W = self.edge_head.weight.detach().cpu().numpy()
-        edge_b = self.edge_head.bias.detach().cpu().numpy()
-        return W, a, edge_W, edge_b
+    def get_weights(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.gat.get_weights()
 
 
-# ── Core compute functions (edge-based only) ───────────────────────────────────
+# ── Core compute functions (node-based for line graph) ──────────────────────────
 
-def compute_plain_training_batch_edge(
+def compute_plain_training_batch(
     *,
     x_batch: np.ndarray,
     edge_index_batch: np.ndarray,
-    edge_feats_batch: np.ndarray,
-    y_edges_batch: np.ndarray,
-    node_in_dim: int,
-    hidden_dim: int,
-    edge_feat_dim: int,
+    y_batch: np.ndarray,
+    train_mask: np.ndarray,
+    in_channels: int,
+    out_channels: int,
     W: np.ndarray,
     a: np.ndarray,
-    edge_head_weight: np.ndarray,
-    edge_head_bias: np.ndarray,
     num_epochs: int = 3,
     negative_slope: float = 0.2,
     lr: float = 0.01,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
+) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
     """
-    Train one edge-batch: GAT + edge classifier; loss on edge labels.
-    Returns W_new, a_new, edge_head_weight_new, edge_head_bias_new, metrics_rows.
+    Train one node-batch (line-graph subgraph). Loss only on nodes where train_mask is True.
+    Returns W_new, a_new, metrics_rows.
     """
-    model = PlainGATModelEdge(node_in_dim, hidden_dim, edge_feat_dim, negative_slope)
-    model.load_weights(W, a, edge_head_weight, edge_head_bias)
+    model = PlainGATModel(in_channels, out_channels, negative_slope)
+    model.load_weights(W, a)
 
     x_t = torch.tensor(x_batch, dtype=torch.float32)
     ei_t = torch.tensor(edge_index_batch, dtype=torch.long)
-    ef_t = torch.tensor(edge_feats_batch, dtype=torch.float32)
-    y_t = torch.tensor(y_edges_batch, dtype=torch.float32)
+    y_t = torch.tensor(y_batch, dtype=torch.float32).unsqueeze(1)  # (N, 1)
+    mask_t = torch.tensor(train_mask, dtype=torch.bool)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     metrics_rows: List[Dict] = []
@@ -241,65 +208,65 @@ def compute_plain_training_batch_edge(
         with _Timer(f"epoch_{epoch:03d}", extra) as timer:
             model.train()
             optimizer.zero_grad()
-            logits = model(x_t, ei_t, ef_t)
+            logits = model(x_t, ei_t)  # (N, out_channels)
+            logits = logits[mask_t]
+            y_masked = y_t[mask_t]
+            if logits.numel() == 0:
+                metrics_rows.append({
+                    "phase": "train_batch", "batch": 0, "epoch": epoch,
+                    "seconds": 0.0, "rss_delta_bytes": 0, "rss_after_bytes": 0,
+                    "energy_joules": 0.0, "power_watts": 0.0, "loss": 0.0, "train_acc": 0.0,
+                })
+                continue
             pos_weight = torch.tensor(
-                [(len(y_edges_batch) - np.sum(y_edges_batch)) / (np.sum(y_edges_batch) + 1e-6)],
+                [(y_masked.numel() - y_masked.sum().item()) / (y_masked.sum().item() + 1e-6)],
                 dtype=torch.float32,
             )
-            loss = F.binary_cross_entropy_with_logits(logits, y_t, pos_weight=pos_weight)
+            loss = F.binary_cross_entropy_with_logits(logits, y_masked, pos_weight=pos_weight)
             loss.backward()
             optimizer.step()
             with torch.no_grad():
                 preds = (torch.sigmoid(logits) > 0.5).long()
-                correct = (preds == y_t.long()).float().mean().item()
+                correct = (preds.squeeze(-1) == y_masked.squeeze(-1).long()).float().mean().item()
             extra["loss"] = float(loss.item())
             extra["train_acc"] = float(correct)
 
         m = timer.metric
         metrics_rows.append({
-            "phase": "train_batch",
-            "batch": 0,
-            "epoch": epoch,
-            "seconds": m.seconds,
-            "rss_delta_bytes": m.rss_delta_bytes,
-            "rss_after_bytes": m.rss_after_bytes,
-            "energy_joules": m.energy_joules,
-            "power_watts": m.power_watts,
-            "loss": extra.get("loss", 0.0),
+            "phase": "train_batch", "batch": 0, "epoch": epoch,
+            "seconds": m.seconds, "rss_delta_bytes": m.rss_delta_bytes,
+            "rss_after_bytes": m.rss_after_bytes, "energy_joules": m.energy_joules,
+            "power_watts": m.power_watts, "loss": extra.get("loss", 0.0),
             "train_acc": extra.get("train_acc", 0.0),
         })
 
-    W_new, a_new, edge_W_new, edge_b_new = model.get_weights()
-    return W_new, a_new, edge_W_new, edge_b_new, metrics_rows
+    W_new, a_new = model.get_weights()
+    return W_new, a_new, metrics_rows
 
 
-def compute_plain_infer_batch_edge(
+def compute_plain_infer_batch(
     *,
     x_batch: np.ndarray,
     edge_index_batch: np.ndarray,
-    edge_feats_batch: np.ndarray,
-    node_in_dim: int,
-    hidden_dim: int,
-    edge_feat_dim: int,
+    node_indices: np.ndarray,
+    in_channels: int,
+    out_channels: int,
     W: np.ndarray,
     a: np.ndarray,
-    edge_head_weight: np.ndarray,
-    edge_head_bias: np.ndarray,
     negative_slope: float = 0.2,
     batch_id: int = 0,
 ) -> Tuple[np.ndarray, Dict]:
-    """Run forward on an edge batch; return logits per edge (E_batch,) and metrics."""
-    model = PlainGATModelEdge(node_in_dim, hidden_dim, edge_feat_dim, negative_slope)
-    model.load_weights(W, a, edge_head_weight, edge_head_bias)
+    """Run forward on a node batch (line-graph subgraph); return logits for ALL nodes (N_batch,). Caller takes logits[node_indices]."""
+    model = PlainGATModel(in_channels, out_channels, negative_slope)
+    model.load_weights(W, a)
     model.eval()
 
     x_t = torch.tensor(x_batch, dtype=torch.float32)
     ei_t = torch.tensor(edge_index_batch, dtype=torch.long)
-    ef_t = torch.tensor(edge_feats_batch, dtype=torch.float32)
 
     with _Timer(f"batch_{batch_id:04d}") as timer, torch.no_grad():
-        logits = model(x_t, ei_t, ef_t)
-        logits = logits.cpu().numpy()
+        logits = model(x_t, ei_t)  # (N, out_channels)
+        logits = logits.cpu().numpy().squeeze(-1)  # (N,)
 
     m = timer.metric
     batch_metrics = {
@@ -313,6 +280,8 @@ def compute_plain_infer_batch_edge(
     }
     return logits, batch_metrics
 
+
+# ── Legacy edge-based (kept for reference; line-graph path uses node-based above) ─
 
 # ── Connection handler ────────────────────────────────────────────────────────
 
@@ -334,20 +303,20 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 payload: Dict = pickle.loads(raw)
 
                 try:
-                    logits, batch_metrics = compute_plain_infer_batch_edge(
+                    logits_all, batch_metrics = compute_plain_infer_batch(
                         x_batch=np.asarray(payload["x_batch"], dtype=np.float64),
                         edge_index_batch=np.asarray(payload["edge_index_batch"], dtype=np.int64),
-                        edge_feats_batch=np.asarray(payload["edge_feats_batch"], dtype=np.float64),
-                        node_in_dim=int(payload["node_in_dim"]),
-                        hidden_dim=int(payload["hidden_dim"]),
-                        edge_feat_dim=int(payload["edge_feat_dim"]),
+                        node_indices=np.asarray(payload["node_indices"], dtype=np.int64),
+                        in_channels=int(payload["in_channels"]),
+                        out_channels=int(payload["out_channels"]),
                         W=np.asarray(payload["W"], dtype=np.float64),
                         a=np.asarray(payload["a"], dtype=np.float64),
-                        edge_head_weight=np.asarray(payload["edge_head_weight"], dtype=np.float64),
-                        edge_head_bias=np.asarray(payload["edge_head_bias"], dtype=np.float64),
                         negative_slope=float(payload.get("negative_slope", 0.2)),
                         batch_id=int(payload.get("batch_id", 0)),
                     )
+                    # Client expects logits for target nodes only (one per batch edge)
+                    node_indices = np.asarray(payload["node_indices"], dtype=np.int64)
+                    logits = np.asarray(logits_all)[node_indices]
 
                     infer_metrics_rows = [{
                         "phase": "infer",
@@ -376,23 +345,20 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
             elif cmd == b"G":
                 raw = recv_frame(conn)
                 payload = pickle.loads(raw)
-                W_new, a_new, edge_W_new, edge_b_new, metrics_rows = compute_plain_training_batch_edge(
+                W_new, a_new, metrics_rows = compute_plain_training_batch(
                     x_batch=np.asarray(payload["x_batch"], dtype=np.float64),
                     edge_index_batch=np.asarray(payload["edge_index_batch"], dtype=np.int64),
-                    edge_feats_batch=np.asarray(payload["edge_feats_batch"], dtype=np.float64),
-                    y_edges_batch=np.asarray(payload["y_edges_batch"], dtype=np.float64),
-                    node_in_dim=int(payload["node_in_dim"]),
-                    hidden_dim=int(payload["hidden_dim"]),
-                    edge_feat_dim=int(payload["edge_feat_dim"]),
+                    y_batch=np.asarray(payload["y_batch"], dtype=np.float64),
+                    train_mask=np.asarray(payload["train_mask"], dtype=bool),
+                    in_channels=int(payload["in_channels"]),
+                    out_channels=int(payload["out_channels"]),
                     W=np.asarray(payload["W"], dtype=np.float64),
                     a=np.asarray(payload["a"], dtype=np.float64),
-                    edge_head_weight=np.asarray(payload["edge_head_weight"], dtype=np.float64),
-                    edge_head_bias=np.asarray(payload["edge_head_bias"], dtype=np.float64),
                     num_epochs=payload.get("num_epochs", payload.get("epochs", 1)),
                     negative_slope=float(payload.get("negative_slope", 0.2)),
                     lr=float(payload.get("lr", 0.01)),
                 )
-                result = {"W": W_new, "a": a_new, "edge_head_weight": edge_W_new, "edge_head_bias": edge_b_new, "metrics": metrics_rows}
+                result = {"W": W_new, "a": a_new, "metrics": metrics_rows}
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 write_metrics_csv(f"server_train_metrics_{ts}.csv", result.get("metrics", []))
                 send_ok(conn)
@@ -417,7 +383,7 @@ def serve(host: str = "127.0.0.1", port: int = 9998) -> None:
         srv.bind((host, port))
         srv.listen(8)
         print(f"[server] Plaintext GAT server listening on {host}:{port}")
-        print("[server]  b'G' -> gradient step (edge batch)  |  b'I' -> infer (edge batch)")
+        print("[server]  b'G' -> gradient step (line-graph node batch)  |  b'I' -> infer (line-graph node batch)")
         try:
             while True:
                 conn, addr = srv.accept()

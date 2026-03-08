@@ -6,20 +6,33 @@
 
 This project implements a **single-layer GAT encoder** with **100% encrypted operations** using OpenFHE Python (**CKKS only** in the current codebase). The server never holds the secret key; the client encrypts inputs and decrypts outputs. All intermediate computations on the server are performed on encrypted data.
 
-**Task**: **Edge-based (link) prediction** — each data row is one **edge** (e.g. one communication); the label is **per edge** (benign vs malicious). The pipeline trains and evaluates on edges, not on nodes.
+**Task**: **Edge (link) prediction** — each data row is one **edge** (e.g. one communication); the label is **per edge** (benign vs malicious). We use the **line graph (dual graph)**; node-based GAT only (no edge head). The pipeline trains and evaluates on line-graph nodes (= edges).
 
-## Why the Edge Head? Why a Second Layer for Prediction?
+### Input data (graph and link features)
 
-The GAT layer is **node-level**: it takes node features and the graph structure and outputs **one embedding vector per node**. There is no direct “edge logit” from GAT alone. For **edge (link) prediction** we need a **score per edge**, not per node.
+Each CSV row is one **link** (one communication). The loader expects **6 columns**:
 
-That is why we add an **edge head** (a second, small computation):
+| Column       | Role |
+| ------------ | ----- |
+| **src_ip**   | Source endpoint; unique IPs become node IDs in the original graph. |
+| **dst_ip**   | Destination endpoint; used with src_ip to form edges (src, dst). |
+| **src_bytes**| Traffic feature (bytes from source); StandardScaler-normalised → line-graph node feature (1 of 3). |
+| **dst_bytes**| Traffic feature (bytes to destination); normalised → line-graph node feature (2 of 3). |
+| **duration** | Traffic feature (connection duration); normalised → line-graph node feature (3 of 3). |
+| **label**    | **Target** for the link (e.g. 0 = benign, 1 = malicious); one per row → line-graph node label. |
 
-1. **GAT output**: For each node we get an embedding `h_i` (e.g. 8-dimensional). So we have **node embeddings**, not edge scores.
-2. **Edge score**: For each edge `(src, dst)` we need one scalar (e.g. logit for “malicious?”). To get it we **combine** the two endpoints’ embeddings (and optionally the edge’s own features, e.g. bytes, duration).
-3. **Edge head**: A small **linear** (or MLP) layer that takes `[h_src; h_dst; edge_features]` and outputs one number:  
-   `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge`.
+- **Graph topology**: `src_ip` and `dst_ip` define the original graph (edges) and, after building the line graph, which line-graph nodes are adjacent. They are **not** sent as numeric features—only used to build `edge_index` / `edge_index_line`.
+- **Features sent in the graph**: The **line-graph node features** sent to the server (plain: `x_batch`; FHE: encrypted `node_features_enc`) are exactly the 3-dim vector **(src_bytes, dst_bytes, duration)** per row (per link), StandardScaler-normalised. See `client_server/client/utils.py` (`load_iot_edge_train_test` → `edge_feats` → `build_line_graph` → `x_line` → `build_line_graph_batch` → `x_batch`).
+- **Target**: `label` is the per-link target; sent as `y_batch` (plain) or encrypted `ct_labels` (FHE) for training, and used for evaluation (precision, recall, F1).
 
-So the “second layer” is not a second GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. In the **plaintext** pipeline this runs on the server (GAT + edge head in one forward). In the **FHE** pipeline the server only runs the GAT (encrypted); the client **decrypts node embeddings** and then runs the edge head **in plaintext** on the client (or the server could run an FHE edge head in a future extension). Either way, the edge head is what turns **node representations** into **edge predictions**.
+## Line graph (dual graph): node-based GAT only
+
+The GAT layer is **node-level**: it takes node features and the graph and outputs **one value per node**. For **edge (link) prediction** we need **one score per edge**. We use the **line graph** instead:
+
+1. **Line graph**: Each **original edge** becomes a **node**; two nodes are adjacent iff the corresponding edges share a vertex. Node features = edge features (e.g. src_bytes, dst_bytes, duration); node label = edge label.
+2. **Build once**: `build_line_graph(edge_index, edge_feats, edge_labels)` → `x_line`, `edge_index_line`, `y_line`.
+3. **Batching**: `build_line_graph_batch(...)` returns an induced subgraph and `target_indices`. Only nodes at `target_indices` get `train_mask=True` (training) or their logits are taken (inference).
+4. **Result**: One logit per line-graph node = **one prediction per original edge**. No edge head. Plain and FHE both use this; the server runs only the GAT (encrypted in FHE); the client decrypts **node logits**.
 
 ## Key Achievements
 
@@ -29,8 +42,8 @@ So the “second layer” is not a second GAT layer; it is an **edge-level class
 - ✅ **Homomorphic Division**: Newton-Raphson in `fhe_utils_ckks.py` for encrypted softmax
 - ✅ **Secure Storage**: `FHEGraph` (server) stores only encrypted features
 - ✅ **Metrics**: CSV-based timing, RSS, and optional power/energy (see `client_server/README.md`)
-- ✅ **Plaintext Baseline**: `plain_client` / `plain_server` for comparison (edge-based, same data and batching)
-- ✅ **Edge-based pipeline**: One row = one edge; labels per edge; edge head for link prediction (see above)
+- ✅ **Plaintext Baseline**: `plain_client` / `plain_server` for comparison (line-graph, same data and batching)
+- ✅ **Line-graph pipeline**: One row = one edge; build line graph once; node-based GAT; one logit per node = per edge; no edge head
 
 ## Project Files (current codebase)
 
@@ -158,12 +171,12 @@ class FHEGraph:
 
 **Security**: Plaintext features exist only during encryption, never retained.
 
-## Architecture: Fully-Encrypted Pipeline (Edge-Based)
+## Architecture: Fully-Encrypted Pipeline (Line-Graph, Node-Based)
 
-Data: one row = one edge; node features (e.g. 2-dim structural: in/out degree); edge features (e.g. 3-dim: src_bytes, dst_bytes, duration). GAT runs on encrypted node features and outputs **encrypted node embeddings**. The edge head (plaintext on client after decryption, or future FHE) turns those into one score per edge.
+Data: one row = one link (edge); CSV columns: **src_ip**, **dst_ip**, **src_bytes**, **dst_bytes**, **duration**, **label**. We build the **line graph** once (one node per edge); line-graph node features = **(src_bytes, dst_bytes, duration)** (3-dim); node label = **label**. GAT runs on encrypted line-graph node features and outputs **encrypted node logits** (one per original edge). No edge head.
 
 ```
-Input: Plaintext x (N, F_in) + edge_index (2, E)  [F_in=2 for edge-based node features]
+Input: Line-graph subgraph x (N, F_in) + edge_index (2, E)  [F_in=3, F_out=1]
                     ↓
 ┌────────────────────────────────────────────────────────┐
 │ 0. Encrypt & Store (FHEGraph.from_plain_encrypted)    │
@@ -210,8 +223,8 @@ Input: Plaintext x (N, F_in) + edge_index (2, E)  [F_in=2 for edge-based node fe
 │    ⚠️  ONLY decryption in entire pipeline              │
 └────────────────────────────────────────────────────────┘
 
-Output: Node embeddings (N, F_out) with CKKS approximation error
-       → Client decrypts; edge head: logit_e = f(h_src, h_dst, edge_feats) per edge
+Output: Node logits (N, F_out=1) with CKKS approximation error
+       → Client decrypts; logits[target_indices] = predictions per original edge
 ```
 
 ## Configuration Profiles
@@ -318,8 +331,8 @@ GATEncoderFHE(
 class FHEGraph:
     num_nodes: int
     in_channels: int
-    edge_index: np.ndarray              # Plaintext topology (standard in GNN FHE)
-    node_features_enc: List[Ciphertext]  # ONLY encrypted (no plaintext field!)
+    edge_index: np.ndarray              # (Line-graph) subgraph adjacency
+    node_features_enc: List[Ciphertext]  # ONLY encrypted (no plaintext field; no edge_features)
 ```
 
 **API**:

@@ -83,6 +83,9 @@ def run_gat_pipeline_fhe_training(
                 encoder._ct_W_list[k] = cc.EvalSub(
                     encoder._ct_W_list[k], ct_scaled_grad
                 )
+                del ct_scaled_grad
+            del pt_lr, grad_W_enc
+            gc.collect()
 
         gc.collect()
 
@@ -92,8 +95,7 @@ def run_gat_pipeline_fhe_training(
                     encoder._ct_W_list[k] = cc.EvalBootstrap(
                         encoder._ct_W_list[k]
                     )
-
-        gc.collect()
+            gc.collect()
 
         if print_metrics:
             print(f"  FHE epoch {epoch+1}/{num_epochs} (streaming)")
@@ -143,6 +145,8 @@ def _run_forward_with_intermediates(
             cc.EvalChebyshevSeries(ct_e, coeffs, -3.0, 3.0)
             for ct_e in attention_scores
         ]
+    del attention_scores
+    gc.collect()
 
     # ---- PACK NODE EMBEDDINGS ----
     ct_h_packed = []
@@ -151,9 +155,10 @@ def _run_forward_with_intermediates(
         for k in range(1, encoder.out_channels):
             ct_rot = cc.EvalRotate(ct_h_list[i][k], k)
             ct_packed = cc.EvalAdd(ct_packed, ct_rot)
+            del ct_rot
         ct_h_packed.append(ct_packed)
 
-    del ct_h_list
+    del ct_h_list, coeffs
     gc.collect()
 
     # ---- STREAM SOFTMAX + (OPTIONAL) BACKWARD ----
@@ -192,6 +197,7 @@ def _run_forward_with_intermediates(
             initial_guess=initial_guess,
             slots=encoder.slots,
         )
+        del ct_sum
 
         acc = None
 
@@ -206,6 +212,7 @@ def _run_forward_with_intermediates(
                 acc = term
             else:
                 acc = cc.EvalAdd(acc, term)
+                del term
 
             # ---- STREAM BACKWARD ----
             if training and train_mask[t]:
@@ -213,6 +220,7 @@ def _run_forward_with_intermediates(
                     acc, sigmoid_coeffs, -5.0, 5.0
                 )
                 ct_grad_out = cc.EvalSub(ct_sig, ct_labels[t])
+                del ct_sig
 
                 for out_k in range(encoder.out_channels):
                     grad_term = cc.EvalMult(
@@ -224,6 +232,7 @@ def _run_forward_with_intermediates(
                         grad_W_enc[out_k] = cc.EvalAdd(
                             grad_W_enc[out_k], grad_term
                         )
+                    del grad_term
 
         # Guard: if acc is still None despite non-empty edge_indices (e.g. all
         # src indices were out-of-range), fall back to an encrypted zero so we
@@ -234,7 +243,7 @@ def _run_forward_with_intermediates(
 
         out_cts.append(acc)
 
-        del ct_exp_local
+        del ct_exp_local, ct_recip
         gc.collect()
 
     del e_after

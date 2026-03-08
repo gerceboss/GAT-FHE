@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-CKKS-only FHE GAT server: raw TCP transport.
+CKKS-only FHE GAT server: raw TCP transport. Line-graph (dual graph) formulation.
 
-No secret key on server. Client sends encrypted weights, features, labels
-over a persistent TCP connection using OpenFHE BINARY serialization.
+No secret key on server. Client sends encrypted weights, node features, and labels
+over a persistent TCP connection using OpenFHE BINARY serialization. All payloads
+operate on line-graph (sub)graphs: one node = one original edge, node-level GAT
+outputs one logit per node (= per original edge).
 
 Protocol (batched-friendly):
   Client connects, sends 1-byte command:
     b'T' -> full-train         (send_train_payload / recv_train_result)
     b'I' -> infer (per call)   (send_infer_payload / recv_infer_result)
-    b'G' -> gradient-step      (batched FHE training on one subgraph)
+    b'G' -> gradient-step      (line-graph subgraph + train_mask; batched FHE training)
 
   Server sends status frame (b'\x00' ok, b'\x01' + error string on error),
   then the result frames.
@@ -129,12 +131,16 @@ def compute_fhe_training_batch(
     edge_index,
     node_features_enc,
     ct_labels,
+    train_mask,
     lr,
     num_epochs,
 ):
     """
-    Perform mini-batch encrypted training.
-    Runs `num_epochs` encrypted epochs on this subgraph.
+    Perform mini-batch encrypted training on a line-graph subgraph.
+
+    The subgraph is an induced subgraph of the line graph (batch of line-graph
+    nodes + their 1-hop neighbours). train_mask: only nodes with True contribute
+    to the loss (the batch target nodes). Runs num_epochs encrypted epochs.
     Returns:
         ct_W_list_new, metrics_dict
     """
@@ -144,6 +150,9 @@ def compute_fhe_training_batch(
     edge_index_np = np.asarray(edge_index, dtype=np.int64)
     if edge_index_np.shape[0] != 2:
         edge_index_np = edge_index_np.T
+    train_mask_np = np.asarray(train_mask, dtype=bool)
+    if train_mask_np.size != num_nodes:
+        train_mask_np = np.ones(num_nodes, dtype=bool)
 
     graph = FHEGraph.from_encrypted(
         num_nodes=num_nodes,
@@ -168,7 +177,7 @@ def compute_fhe_training_batch(
         encoder=encoder,
         graph=graph,
         ct_labels=ct_labels,
-        train_mask=np.ones(num_nodes, dtype=bool),
+        train_mask=train_mask_np,
         num_epochs=num_epochs,
         lr=lr,
         print_metrics=False,
@@ -286,7 +295,8 @@ def compute_forward_only(
     bootstrap_level_threshold: int = 4,
 ) -> tuple:
     """
-    Run one forward pass (inference only). Returns (out_cts, metrics_dict).
+    Run one forward pass (inference only) on a line-graph subgraph. Returns (out_cts, metrics_dict).
+    One output ciphertext per node; client interprets logits at target node indices as per-edge predictions.
 
     After the forward pass the output ciphertexts are refreshed via
     EvalBootstrap() whenever their remaining multiplicative depth is at or
@@ -396,7 +406,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     out_cts, metrics, ct_W_trained = compute_fhe_training(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_train_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_metrics_train_{ts}.csv", metrics)
                     send_ok(conn)
                     send_train_result(conn, out_cts, metrics, ct_W_trained)
                 except Exception as exc:
@@ -412,7 +422,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     out_cts, metrics = compute_forward_only(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_infer_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_metrics_infer_{ts}.csv", metrics)
                     send_ok(conn)
                     send_infer_result(conn, out_cts, metrics)
                 except Exception as exc:
@@ -433,7 +443,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     ct_W_new, metrics = compute_fhe_training_batch(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_grad_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_metrics_grad_{ts}.csv", metrics)
                     send_ok(conn)
                     send_gradient_step_result(conn, ct_W_new, metrics)
                 except Exception as exc:

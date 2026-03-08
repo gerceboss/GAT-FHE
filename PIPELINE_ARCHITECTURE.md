@@ -4,11 +4,11 @@
 
 This document describes the **pipeline architecture** for the FHE GAT encoder. The **current codebase** implements this in the **client–server** layout under `client_server/`: CKKS-only pipeline, server never holds the secret key, with shared utilities and consistent metrics.
 
-**Task**: **Edge-based (link) prediction**. Each sample is one **edge** (e.g. one communication record); the label is **per edge** (benign vs malicious). Batches are built over edges (e.g. 60 edges per batch); each batch induces a subgraph of nodes and edges.
+**Task**: **Edge (link) prediction** via the **line graph (dual graph)**. Each sample is one **edge** (e.g. one communication); the label is **per edge**. We build the **line graph** once (one node per edge, node features = edge features); then all training and inference use **node-based GAT** on line-graph (sub)graphs. Batches are line-graph node batches (e.g. 60 nodes per batch); `build_line_graph_batch` returns the induced subgraph and `target_indices` for train_mask / prediction. **No edge head.**
 
 **Current implementation (client_server):**
 
-1. **Client** (`client_server/client/`): Plain and FHE clients; shared data loading (`load_iot_edge_train_test`, `build_edge_batch`), batching, and metrics in `utils.py`; client-side metrics (keygen, encrypt, decrypt) in `metrics.py`.
+1. **Client** (`client_server/client/`): Plain and FHE clients; shared data loading (`load_iot_edge_train_test`), line graph (`build_line_graph`, `build_line_graph_batch`), and metrics in `utils.py`; client-side metrics (keygen, encrypt, decrypt) in `metrics.py`.
 2. **Server** (`client_server/server/`): Plain and FHE servers; shared RSS/CSV/TCP helpers in `utils.py`; FHE pipeline in `ckks_runner.py` and `encoder_ckks.py`; metrics in `metrics.py` / `metrics_pi.py`.
 3. **Metrics**: All outputs are CSV-only, with standard columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`. See `client_server/README.md` for where each file is written and what each field means.
 
@@ -16,17 +16,16 @@ The pipeline steps below (linear, attention, LeakyReLU, softmax, aggregation) ar
 
 ---
 
-## Why the Edge Head? (Second Step for Prediction)
+## Line graph (dual graph): node-based GAT only
 
-The GAT encoder is **node-level**: it consumes node features and the graph and produces **one embedding per node**. It does **not** output a score per edge. For **edge (link) prediction** we need one scalar per edge (e.g. “is this communication malicious?”).
+The GAT encoder is **node-level**: it consumes node features and the graph and produces **one output per node**. For **edge (link) prediction** we need one scalar per edge.
 
-Therefore we add an **edge head** — a second, lightweight computation that turns **pairs of node embeddings** (and optional edge features) into **one score per edge**:
+We use the **line graph (dual graph)** instead of an edge head:
 
-- **Input to edge head**: For each edge `(src, dst)`, we have `h_src`, `h_dst` (GAT embeddings) and optionally `edge_feats` (e.g. src_bytes, dst_bytes, duration).
-- **Computation**: `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge` (one linear layer).
-- **Output**: One logit per edge, then e.g. sigmoid for probability.
-
-So the “second layer” is not another GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. In the **plaintext** server, GAT and edge head run together (e.g. `PlainGATModelEdge`). In the **FHE** path, the server runs only the GAT on encrypted data; the client **decrypts node embeddings** and runs the edge head **in plaintext** (or a future FHE edge head could run on the server). Either way, the edge head is what converts **node representations** into **edge predictions**.
+- **Line graph**: Each **original edge** becomes a **node**; two nodes are adjacent iff the corresponding edges share a vertex. Node features = original edge features (e.g. src_bytes, dst_bytes, duration); node label = edge label.
+- **Build once**: `build_line_graph(edge_index, edge_feats, edge_labels)` → `x_line`, `edge_index_line`, `y_line`.
+- **Batching**: `build_line_graph_batch(batch_line_ids, edge_index_line, x_line, y_line)` returns an induced subgraph (batch nodes + 1-hop neighbours) and `target_indices`. Only nodes at `target_indices` get `train_mask=True` (training) or their logits are taken (inference).
+- **Result**: One logit per line-graph node = **one prediction per original edge**. No edge head.
 
 ---
 
@@ -83,9 +82,7 @@ The GAT encoder pipeline consists of 5 main steps:
 - **Plaintext**: NumPy weighted aggregation
 - **Purpose**: Aggregate neighbor features using attention weights
 
-**Edge head (after GAT)**  
-- **Plaintext**: Linear layer on `[h_src; h_dst; edge_feats]` → one logit per edge (plain server and FHE client).  
-- **Purpose**: Turn node embeddings into edge-level predictions for link/edge classification.
+**No edge head.** In the line-graph pipeline, GAT output is one logit per node (= per original edge); no second layer.
 
 ## Usage (client_server)
 

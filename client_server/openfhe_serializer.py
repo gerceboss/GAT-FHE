@@ -444,6 +444,10 @@ def recv_gradient_step_payload(sock: socket.socket) -> dict:
 
     payload["ct_labels"] = _recv_ct_list(sock)
 
+    payload["train_mask"] = _recv_ndarray(sock)
+    if payload["train_mask"].dtype != np.bool_:
+        payload["train_mask"] = np.asarray(payload["train_mask"], dtype=bool)
+
     lr, num_epochs = struct.unpack("<dq", _recv_frame(sock))
     payload["lr"] = float(lr)
     payload["num_epochs"] = int(num_epochs)
@@ -462,6 +466,8 @@ def send_gradient_step_payload(sock: socket.socket, payload: dict) -> None:
     send_common_payload(sock, payload)
 
     _send_ct_list(sock, payload["ct_labels"])
+
+    _send_ndarray(sock, np.asarray(payload["train_mask"], dtype=bool))
 
     _send_scalar(
         sock,
@@ -541,8 +547,6 @@ def save_trained_weights(
     slots: int,
     F_in: int,
     F_out: int,
-    edge_head_weight=None,
-    edge_head_bias=None,
 ) -> None:
     import json
     import os
@@ -565,11 +569,6 @@ def save_trained_weights(
 
     # Save plaintext attention vector
     np.save(os.path.join(save_dir, "a.npy"), np.asarray(a, dtype=np.float64))
-
-    if edge_head_weight is not None:
-        np.save(os.path.join(save_dir, "edge_head_weight.npy"), np.asarray(edge_head_weight, dtype=np.float64))
-    if edge_head_bias is not None:
-        np.save(os.path.join(save_dir, "edge_head_bias.npy"), np.asarray(edge_head_bias, dtype=np.float64))
 
     print(f"[weights] saved plaintext weights → {save_dir}")
 
@@ -631,12 +630,5 @@ def load_trained_weights(save_dir: str) -> dict:
         "F_in": F_in,
         "F_out": F_out,
     }
-
-    edge_head_weight_path = os.path.join(save_dir, "edge_head_weight.npy")
-    edge_head_bias_path = os.path.join(save_dir, "edge_head_bias.npy")
-    if os.path.exists(edge_head_weight_path):
-        out["edge_head_weight"] = np.load(edge_head_weight_path)
-    if os.path.exists(edge_head_bias_path):
-        out["edge_head_bias"] = np.load(edge_head_bias_path)
 
     return out

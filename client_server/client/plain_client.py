@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Plaintext GAT client: raw TCP transport (no FHE). Edge-based (link) prediction only.
+Plaintext GAT client: raw TCP transport (no FHE). Line-graph (dual) formulation.
 
-  Phase 1 (train): Send edge batches → server trains GAT + edge head → receive
-                   W, a, edge_head_weight, edge_head_bias + metrics.
-  Phase 2 (infer): Batch test edges by --batch_size; send each batch → server
-                   runs forward → receive edge logits. Compute accuracy/F1 over edges.
+  We build the line graph: each node = one original edge; features on nodes.
+  Phase 1 (train): Send line-graph node batches (with train_mask) → server trains
+                   node-level GAT → receive W, a + metrics.
+  Phase 2 (infer): Batch test line-graph nodes → server returns logits for subgraph;
+                   we take logits[target_indices] as predictions for original edges.
 
 Arguments:
-  --batch_size  INT   Edges per batch (default 60)
-  --test_ratio  FLOAT Fraction of edges held out for testing (default 0.2)
-  --epochs      INT   Training epochs per batch (default 3)
-  --lr          FLOAT Learning rate (default 0.01)
-  --host        STR   Server host (omit for in-process mode)
-  --port        INT   Server port (default 9998)
-  --data        STR   Path to iot.csv
-  --max_edges   INT   Cap edges for quick runs (optional)
+  --batch_size       INT   Edges per batch (default 60)
+  --test_ratio       FLOAT Fraction of edges held out for testing (default 0.2)
+  --epochs           INT   Training epochs per batch (default 3)
+  --lr               FLOAT Learning rate (default 0.01)
+  --host             STR   Server host (omit for in-process mode)
+  --port             INT   Server port (default 9998)
+  --data             STR   Path to iot.csv
+  --max_rows_dataset INT   Cap CSV rows (edges) for quick runs (optional)
 
 Usage:
   python plain_client.py --batch_size 60 --epochs 3
@@ -49,9 +50,11 @@ except ImportError:
 
 # Shared data loading, batching, metrics (see client_server.client.utils)
 from client_server.client.utils import (
-    build_edge_batch,
+    build_line_graph,
+    build_line_graph_batch,
     compute_classification_metrics,
     load_iot_edge_train_test,
+    make_connected_batches,
 )
 
 
@@ -235,26 +238,32 @@ def main() -> None:
         help="Run inference only (requires --load_weights)."
     )
     parser.add_argument(
-        "--max_edges",
+        "--max_rows_dataset",
         type=int,
         default=None,
-        help="Cap number of edges for quick runs (edge mode only)."
+        help="Cap number of CSV rows (edges) for quick runs."
+    )
+    parser.add_argument(
+        "--max_degree_batch",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Cap in-degree per node in each batch (max edges = batch_size*K). Omit for no cap. For FHE on 8GB use e.g. 8--15.",
     )
     args = parser.parse_args()
     batch_csv_rows = []
     ts = time.strftime("%Y%m%d_%H%M%S")
 
-    # Edge-based model dimensions
-    NODE_IN_DIM = 2   # in_degree, out_degree
-    HIDDEN_DIM = 8
-    EDGE_FEAT_DIM = 3  # src_bytes, dst_bytes, duration
+    # Line-graph node dimensions (features = edge features: src_bytes, dst_bytes, duration)
+    IN_CHANNELS = 3
+    OUT_CHANNELS = 1   # one logit per node = per original edge
     negative_slope = 0.2
 
     print("=" * 70)
-    print("Plaintext GAT — IoT Malicious Edge (Link) Prediction")
+    print("Plaintext GAT — IoT Malicious Edge (Link) via Line Graph")
     print(
-        f"  batch_size={args.batch_size} edges  epochs={args.epochs}  "
-        f"lr={args.lr}  test_ratio={args.test_ratio}  max_edges={args.max_edges or 'ALL'}"
+        f"  batch_size={args.batch_size} line-graph nodes  epochs={args.epochs}  "
+        f"lr={args.lr}  test_ratio={args.test_ratio}  max_rows_dataset={args.max_rows_dataset or 'ALL'}"
     )
     if args.host:
         print(f"  Transport: TCP  {args.host}:{args.port}")
@@ -262,7 +271,7 @@ def main() -> None:
         print("  Transport: in-process (no network)")
     print("=" * 70)
 
-    # ── 1. Load edge data ───────────────────────────────────────────────────────
+    # ── 1. Load edge data and build line graph ───────────────────────────────────
     print("\n1. Loading IoT edge train + test...")
     (
         x_nodes,
@@ -276,25 +285,30 @@ def main() -> None:
         path=args.data,
         test_ratio=args.test_ratio,
         seed=args.seed,
-        max_edges=args.max_edges,
+        max_rows_dataset=args.max_rows_dataset,
     )
     n_train_edges = len(train_edge_ids)
     n_test_edges = len(test_edge_ids)
     E_total = edge_index_full.shape[1]
-    n_batches_train = max(1, (n_train_edges + args.batch_size - 1) // args.batch_size)
-    n_batches_test = max(1, (n_test_edges + args.batch_size - 1) // args.batch_size)
-    print(
-        f"   Nodes={N}, Edges={E_total}  Train edges={n_train_edges}, Test edges={n_test_edges}"
-    )
-    print(f"   Batches train={n_batches_train}, test={n_batches_test} (batch_size={args.batch_size} edges)")
+    print(f"   Original: Nodes={N}, Edges={E_total}  Train edges={n_train_edges}, Test edges={n_test_edges}")
 
-    # ── 2. Initialise weights (GAT + edge head) ───────────────────────────────
+    print("   Building line graph (one node per edge)...")
+    x_line, edge_index_line, y_line = build_line_graph(edge_index_full, edge_feats, edge_labels)
+    n_line = x_line.shape[0]
+    # Train/test IDs are edge indices = line-graph node IDs
+    train_line_ids = train_edge_ids
+    test_line_ids = test_edge_ids
+    # Connected batches: BFS-grown subgraphs (fewer edges per batch than contiguous chunks)
+    train_batches = make_connected_batches(train_line_ids, edge_index_line, args.batch_size)
+    test_batches = make_connected_batches(test_line_ids, edge_index_line, args.batch_size)
+    n_batches_train = len(train_batches)
+    n_batches_test = len(test_batches)
+    print(f"   Line graph: nodes={n_line}  Batches train={n_batches_train}, test={n_batches_test} (batch_size={args.batch_size}, connected)")
+
+    # ── 2. Initialise weights (node-level GAT only; no edge head) ───────────────
     rng = np.random.default_rng(args.seed)
-    W = rng.standard_normal((HIDDEN_DIM, NODE_IN_DIM)).astype(np.float64) * 0.1
-    a = rng.standard_normal((2 * HIDDEN_DIM,)).astype(np.float64) * 0.1
-    edge_head_in = 2 * HIDDEN_DIM + EDGE_FEAT_DIM
-    edge_head_weight = rng.standard_normal((1, edge_head_in)).astype(np.float64) * 0.1
-    edge_head_bias = rng.standard_normal((1,)).astype(np.float64) * 0.1
+    W = rng.standard_normal((OUT_CHANNELS, IN_CHANNELS)).astype(np.float64) * 0.1
+    a = rng.standard_normal((2 * OUT_CHANNELS,)).astype(np.float64) * 0.1
 
     if args.load_weights:
         print(f"\n[weights] Loading plaintext weights from {args.load_weights}")
@@ -304,43 +318,42 @@ def main() -> None:
         ckpt = torch.load(weights_path)
         W = ckpt["W"].numpy() if torch.is_tensor(ckpt["W"]) else ckpt["W"]
         a = ckpt["a"].numpy() if torch.is_tensor(ckpt["a"]) else ckpt["a"]
-        edge_head_weight = ckpt["edge_head_weight"].numpy() if torch.is_tensor(ckpt.get("edge_head_weight")) else ckpt["edge_head_weight"]
-        edge_head_bias = ckpt["edge_head_bias"].numpy() if torch.is_tensor(ckpt.get("edge_head_bias")) else ckpt["edge_head_bias"]
         print("   Weights loaded. Skipping training.")
 
-    # ── 3. Training (edge batches) ──────────────────────────────────────────────
+    # ── 3. Training (line-graph node batches) ───────────────────────────────────
     train_time = 0.0
+    all_train_metrics_rows: List[Dict] = []  # for in-process: write server_train_metrics_*.csv
     if not args.load_weights and not args.infer_only:
-        print(f"\n3. Mini-batch training ({args.epochs} epochs per batch, edge-based)...")
+        print(f"\n3. Mini-batch training ({args.epochs} epochs per batch, line-graph nodes)...")
         _train_t0 = time.perf_counter()
-        shuffled_train_ids = rng.permutation(train_edge_ids)
+        train_batches_shuffled = [list(b) for b in train_batches]
+        rng.shuffle(train_batches_shuffled)
 
         for b_idx in range(n_batches_train):
-            start = b_idx * args.batch_size
-            end = min(start + args.batch_size, n_train_edges)
-            batch_edge_ids = shuffled_train_ids[start:end]
+            batch_line_ids = np.asarray(train_batches_shuffled[b_idx], dtype=np.int64)
 
-            x_batch, edge_index_local, edge_feats_batch, y_edges_batch, _ = build_edge_batch(
-                batch_edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes,
+            x_batch, edge_index_batch, y_batch, target_indices = build_line_graph_batch(
+                batch_line_ids, edge_index_line, x_line, y_line,
+                max_degree_per_node=args.max_degree_batch,
             )
 
-            if edge_index_local.shape[1] == 0:
+            if edge_index_batch.shape[1] == 0 and x_batch.shape[0] == 0:
                 continue
 
-            print(f"\n   Batch {b_idx+1}/{n_batches_train} (edges={len(batch_edge_ids)}, nodes={x_batch.shape[0]})")
+            train_mask = np.zeros(x_batch.shape[0], dtype=bool)
+            train_mask[target_indices] = True
+
+            print(f"\n   Batch {b_idx+1}/{n_batches_train} (line-graph nodes={len(batch_line_ids)}, edges in line-graph nodes={edge_index_batch.shape[1]})")
 
             train_payload = {
                 "x_batch": x_batch,
-                "edge_index_batch": edge_index_local,
-                "edge_feats_batch": edge_feats_batch,
-                "y_edges_batch": y_edges_batch.astype(np.float64),
-                "node_in_dim": NODE_IN_DIM,
-                "hidden_dim": HIDDEN_DIM,
-                "edge_feat_dim": EDGE_FEAT_DIM,
+                "edge_index_batch": edge_index_batch,
+                "y_batch": y_batch.astype(np.float64),
+                "train_mask": train_mask,
+                "in_channels": IN_CHANNELS,
+                "out_channels": OUT_CHANNELS,
                 "W": W,
                 "a": a,
-                "edge_head_weight": edge_head_weight,
-                "edge_head_bias": edge_head_bias,
                 "negative_slope": negative_slope,
                 "lr": args.lr,
                 "num_epochs": args.epochs,
@@ -354,31 +367,28 @@ def main() -> None:
                     data = pickle.loads(_recv_frame(sock))
                 W = np.asarray(data["W"], dtype=np.float64)
                 a = np.asarray(data["a"], dtype=np.float64)
-                edge_head_weight = np.asarray(data["edge_head_weight"], dtype=np.float64)
-                edge_head_bias = np.asarray(data["edge_head_bias"], dtype=np.float64)
                 batch_metrics_rows = data.get("metrics", [])
             else:
-                from client_server.server.plain_server import compute_plain_training_batch_edge
-                W, a, edge_head_weight, edge_head_bias, batch_metrics_rows = compute_plain_training_batch_edge(
+                from client_server.server.plain_server import compute_plain_training_batch
+                W, a, batch_metrics_rows = compute_plain_training_batch(
                     x_batch=x_batch,
-                    edge_index_batch=edge_index_local,
-                    edge_feats_batch=edge_feats_batch,
-                    y_edges_batch=y_edges_batch.astype(np.float64),
-                    node_in_dim=NODE_IN_DIM,
-                    hidden_dim=HIDDEN_DIM,
-                    edge_feat_dim=EDGE_FEAT_DIM,
+                    edge_index_batch=edge_index_batch,
+                    y_batch=y_batch.astype(np.float64),
+                    train_mask=train_mask,
+                    in_channels=IN_CHANNELS,
+                    out_channels=OUT_CHANNELS,
                     W=W,
                     a=a,
-                    edge_head_weight=edge_head_weight,
-                    edge_head_bias=edge_head_bias,
                     num_epochs=args.epochs,
                     negative_slope=negative_slope,
                     lr=args.lr,
                 )
+                for r in batch_metrics_rows:
+                    all_train_metrics_rows.append({**r, "batch": b_idx})
 
             server_t = sum(r.get("seconds", 0.0) for r in batch_metrics_rows)
             batch_csv_rows.append({
-                "phase": "train", "batch": b_idx, "edges_in_batch": len(batch_edge_ids),
+                "phase": "train", "batch": b_idx, "edges_in_batch": len(batch_line_ids),
                 "server_time_seconds": server_t,
             })
             print(f"      Completed {args.epochs} epochs  server_t={server_t:.4f}s")
@@ -388,47 +398,44 @@ def main() -> None:
             os.makedirs(args.save_weights, exist_ok=True)
             torch.save({
                 "W": torch.tensor(W), "a": torch.tensor(a),
-                "edge_head_weight": torch.tensor(edge_head_weight),
-                "edge_head_bias": torch.tensor(edge_head_bias),
             }, os.path.join(args.save_weights, "plain_weights.pt"))
             print(f"[weights] Saved → {args.save_weights}")
+        if not args.host and all_train_metrics_rows:
+            from client_server.server.utils import write_metrics_csv
+            write_metrics_csv(f"server_train_metrics_{ts}.csv", all_train_metrics_rows)
         if args.train_only:
             print("\n✓ Training complete (train_only). Exiting.")
             return
 
-    # ── 4. Inference (edge batches) ─────────────────────────────────────────────
+    # ── 4. Inference (line-graph node batches) ───────────────────────────────────
     if args.infer_only and not args.load_weights:
         raise ValueError("--infer_only requires --load_weights")
 
     if not args.train_only:
-        print(f"\n4. Inference on {n_test_edges} test edges...")
+        print(f"\n4. Inference on {n_test_edges} test edges (line-graph nodes)...")
         all_logits = []
         all_y_true = []
         server_batch_metrics_list = []
         batch_csv_rows = []
 
         for b_idx in range(n_batches_test):
-            start = b_idx * args.batch_size
-            end = min(start + args.batch_size, n_test_edges)
-            batch_edge_ids = test_edge_ids[start:end]
+            batch_line_ids = np.asarray(test_batches[b_idx], dtype=np.int64)
 
-            x_batch, edge_index_local, edge_feats_batch, y_edges_batch, _ = build_edge_batch(
-                batch_edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes,
+            x_batch, edge_index_batch, y_batch, target_indices = build_line_graph_batch(
+                batch_line_ids, edge_index_line, x_line, y_line,
+                max_degree_per_node=args.max_degree_batch,
             )
-            if edge_index_local.shape[1] == 0:
+            if x_batch.shape[0] == 0:
                 continue
 
             infer_payload = {
                 "x_batch": x_batch,
-                "edge_index_batch": edge_index_local,
-                "edge_feats_batch": edge_feats_batch,
-                "node_in_dim": NODE_IN_DIM,
-                "hidden_dim": HIDDEN_DIM,
-                "edge_feat_dim": EDGE_FEAT_DIM,
+                "edge_index_batch": edge_index_batch,
+                "node_indices": target_indices,
+                "in_channels": IN_CHANNELS,
+                "out_channels": OUT_CHANNELS,
                 "W": W,
                 "a": a,
-                "edge_head_weight": edge_head_weight,
-                "edge_head_bias": edge_head_bias,
                 "negative_slope": negative_slope,
                 "batch_id": b_idx,
             }
@@ -442,31 +449,29 @@ def main() -> None:
                 logits = result["logits"]
                 batch_metrics = result.get("metrics", {})
             else:
-                from client_server.server.plain_server import compute_plain_infer_batch_edge
-                logits, batch_metrics = compute_plain_infer_batch_edge(
+                from client_server.server.plain_server import compute_plain_infer_batch
+                logits_all, batch_metrics = compute_plain_infer_batch(
                     x_batch=x_batch,
-                    edge_index_batch=edge_index_local,
-                    edge_feats_batch=edge_feats_batch,
-                    node_in_dim=NODE_IN_DIM,
-                    hidden_dim=HIDDEN_DIM,
-                    edge_feat_dim=EDGE_FEAT_DIM,
+                    edge_index_batch=edge_index_batch,
+                    node_indices=target_indices,
+                    in_channels=IN_CHANNELS,
+                    out_channels=OUT_CHANNELS,
                     W=W,
                     a=a,
-                    edge_head_weight=edge_head_weight,
-                    edge_head_bias=edge_head_bias,
                     negative_slope=negative_slope,
                     batch_id=b_idx,
                 )
+                logits = np.asarray(logits_all)[target_indices]
 
             all_logits.extend(np.asarray(logits).ravel().tolist())
-            all_y_true.extend(y_edges_batch.tolist())
+            all_y_true.extend(y_batch[target_indices].tolist())
             server_batch_metrics_list.append(batch_metrics)
             _b_seconds = batch_metrics.get("seconds", 0.0)
             print(f"   Batch {b_idx+1}/{n_batches_test} server_t={_b_seconds:.4f}s")
             batch_csv_rows.append({
                 "step": f"infer_batch_{b_idx}",
                 "server_time": _b_seconds,
-                "edges_in_batch": len(batch_edge_ids),
+                "edges_in_batch": len(batch_line_ids),
             })
 
     import csv
@@ -477,6 +482,22 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(batch_csv_rows)
         print(f"[client] Metrics written → {csv_path}")
+    if not args.host and server_batch_metrics_list:
+        from client_server.server.utils import write_metrics_csv
+        infer_metrics_rows = [
+            {
+                "phase": "infer",
+                "batch": i,
+                "epoch": "",
+                "seconds": m.get("seconds", 0.0),
+                "rss_delta_bytes": m.get("rss_delta_bytes", 0),
+                "rss_after_bytes": m.get("rss_after_bytes", 0),
+                "energy_joules": m.get("energy_joules", 0.0),
+                "power_watts": m.get("power_watts", 0.0),
+            }
+            for i, m in enumerate(server_batch_metrics_list)
+        ]
+        write_metrics_csv(f"server_infer_metrics_{ts}.csv", infer_metrics_rows)
 
     if not args.train_only and all_logits:
         n_test = len(all_y_true)
@@ -508,7 +529,7 @@ def main() -> None:
         print("=" * 70)
         print(f"\n  Training time: {train_time:.4f}s  Inference time: {Tserver:.4f}s")
 
-    print("\n✓ Done. Plaintext edge-based training + inference.")
+    print("\n✓ Done. Plaintext line-graph (node-level GAT) training + inference.")
 
 
 if __name__ == "__main__":

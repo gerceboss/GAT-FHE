@@ -5,6 +5,7 @@ Only from_client_keys_with_encrypted_weights and forward path used in FHE traini
 
 from __future__ import annotations
 
+import gc
 from typing import Any, List
 
 import numpy as np
@@ -99,6 +100,7 @@ class GATEncoderCKKS:
         for k in range(F_out):
             ct_prod = self._cc.EvalMult(ct_x, ct_W_list[k])
             ct_sum = self._sum_slots_via_rotations(ct_prod, self.in_channels)
+            del ct_prod
             ct_h_list.append(ct_sum)
         return ct_h_list
 
@@ -112,6 +114,7 @@ class GATEncoderCKKS:
         F_out = len(ct_h_list[0])
         ct_e_list = []
         a_concat = self._a
+        _gc_interval = max(1, E // 20)
         for e in range(E):
             i, j = edge_index[0, e], edge_index[1, e]
             ct_h_i_packed = None
@@ -121,6 +124,7 @@ class GATEncoderCKKS:
                 else:
                     ct_rotated = self._cc.EvalRotate(ct_h_list[i][k], k)
                     ct_h_i_packed = self._cc.EvalAdd(ct_h_i_packed, ct_rotated)
+                    del ct_rotated
             ct_h_j_packed = None
             for k in range(F_out):
                 ct_rotated = self._cc.EvalRotate(ct_h_list[j][k], F_out + k)
@@ -128,13 +132,19 @@ class GATEncoderCKKS:
                     ct_h_j_packed = ct_rotated
                 else:
                     ct_h_j_packed = self._cc.EvalAdd(ct_h_j_packed, ct_rotated)
+                    del ct_rotated
             ct_concat = self._cc.EvalAdd(ct_h_i_packed, ct_h_j_packed)
+            del ct_h_i_packed, ct_h_j_packed
             a_padded = np.zeros(self._slots, dtype=np.float64)
             a_padded[: min(2 * F_out, self._slots)] = a_concat[: min(2 * F_out, self._slots)]
             pt_a = self._cc.MakeCKKSPackedPlaintext(a_padded.tolist())
             ct_weighted = self._cc.EvalMult(ct_concat, pt_a)
+            del ct_concat, pt_a, a_padded
             ct_e_ij = self._sum_slots_via_rotations(ct_weighted, 2 * F_out)
+            del ct_weighted
             ct_e_list.append(ct_e_ij)
+            if (e + 1) % _gc_interval == 0:
+                gc.collect()
         return ct_e_list
 
     def softmax_ckks_chebyshev(
@@ -168,8 +178,12 @@ class GATEncoderCKKS:
             ct_reciprocal = encrypted_reciprocal_newton_raphson(
                 self._cc, ct_sum, num_iterations=1, initial_guess=initial_guess, slots=self._slots
             )
+            del ct_sum
             for idx in edge_indices:
                 ct_alpha_list[idx] = self._cc.EvalMult(ct_exp_list[idx], ct_reciprocal)
+            del ct_reciprocal
+            if (t + 1) % 10 == 0:
+                gc.collect()
         return ct_alpha_list
 
     def aggregate_fhe(
@@ -200,9 +214,13 @@ class GATEncoderCKKS:
                     w = alpha[edge_idx]
                     pt_scale = self._cc.MakeCKKSPackedPlaintext([w] * self._slots)
                     term = self._cc.EvalMult(ct_list[cols_j[k]], pt_scale)
+                    del pt_scale
                 if acc is None:
                     acc = term
                 else:
                     acc = self._cc.EvalAdd(acc, term)
+                    del term
             out_cts.append(acc)
+            if (t + 1) % 10 == 0:
+                gc.collect()
         return out_cts
