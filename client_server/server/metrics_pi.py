@@ -121,7 +121,8 @@ class MetricsRecorder:
     def __init__(self) -> None:
         self._metrics: list[StepMetric] = []
 
-    def step(self, name: str, active_cores: float = 1.0):
+    def step(self, name: str, active_cores: float = 1.0, encrypted: bool = True, **kwargs):
+        """Accept encrypted= for API compatibility with metrics.MetricsRecorder."""
         return _StepContext(self, name, active_cores)
 
     def add(self, metric: StepMetric) -> None:
@@ -141,19 +142,18 @@ class MetricsRecorder:
             for m in self._metrics
         }
 
-    def write_txt(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(
-                "step,seconds,rss_delta_bytes,rss_after_bytes,"
-                "freq_hz,volt,power_watts,energy_joules\n"
-            )
+    def write_csv(self, path: str) -> None:
+        """Write server-side metrics to CSV: step, server_time, client_time=0, rss_*, power_watts, energy_joules, throughput."""
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "server_time", "client_time", "rss_after_bytes", "rss_delta_bytes", "power_watts", "energy_joules", "throughput"])
             for m in self._metrics:
-                f.write(
-                    f"{m.name},{m.seconds:.6f},"
-                    f"{m.rss_delta_bytes},{m.rss_after_bytes},"
-                    f"{m.freq_hz},{m.volt:.4f},"
-                    f"{m.power_watts:.6f},{m.energy_joules:.6f}\n"
-                )
+                throughput = (1.0 / m.seconds) if m.seconds > 0 else 0.0
+                writer.writerow([
+                    m.name, f"{m.seconds:.6f}", "0.0", m.rss_delta_bytes, m.rss_after_bytes,
+                    f"{m.power_watts:.6f}", f"{m.energy_joules:.6f}", f"{throughput:.6f}",
+                ])
 
 
 # ===============================

@@ -1,26 +1,41 @@
-# 🔐 GAT Client–Server — Plaintext & CKKS FHE
+# GAT Client–Server — Plaintext & CKKS FHE
 
-A **Graph Attention Network (GAT)** for IoT malicious node detection, implemented in two modes:
+A **Graph Attention Network (GAT)** plus **edge head** for **IoT malicious edge (link) detection**: one CSV row = one **edge** (one communication), label **per edge** (benign vs malicious). Implemented in two modes:
 
-- **Plaintext Baseline** — raw NumPy/PyTorch, no encryption
-- **CKKS FHE Secure Version** — OpenFHE, server never holds the secret key
+- **Plaintext Baseline** — PyTorch GAT + edge head, no encryption
+- **CKKS FHE Secure Version** — OpenFHE; server runs GAT on ciphertexts; client decrypts and runs edge head (or loads pre-fitted edge head)
 
-Both modes support three deployment configurations: single-process (no network), two terminals on the same machine, and two separate systems on a local network.
-
----
-
-## 📂 File Overview
-
-| File              | Role                                                                 |
-| ----------------- | -------------------------------------------------------------------- |
-| `plain_client.py` | Plaintext client — loads data, trains, sends batches, evaluates      |
-| `plain_server.py` | Plaintext server — trains GAT and runs forward passes                |
-| `client.py`       | FHE client — generates keys, encrypts data, decrypts results         |
-| `server.py`       | FHE server — all compute on ciphertexts, never sees plaintext        |
+Both modes use the same edge-based data and batching (e.g. 60 edges per batch). Three deployment options: in-process, two terminals (same machine), or two systems on a LAN.
 
 ---
 
-## 📦 Prerequisites
+## File Overview
+
+| Path | Role |
+|------|------|
+| **Client** | |
+| `client/plain_client.py` | Plaintext client — loads data, trains, sends batches, evaluates |
+| `client/client.py` | FHE client — keygen, encrypts data, decrypts results |
+| `client/client_keys.py` | Key generation and key handling for FHE client |
+| `client/utils.py` | Data loading, batching, preprocessing (shared by plain & FHE) |
+| `client/metrics.py` | Client-side metrics (keygen, encrypt, decrypt time) |
+| `client/iot.csv` | Default IoT dataset (optional) |
+| **Server** | |
+| `server/plain_server.py` | Plaintext server — trains GAT and runs forward passes |
+| `server/server.py` | FHE server — all compute on ciphertexts, never sees plaintext |
+| `server/ckks_runner.py` | FHE pipeline runner (forward, training, bootstrap) |
+| `server/encoder_ckks.py` | GATEncoderCKKS — linear, attention, LeakyReLU, softmax, aggregation |
+| `server/fhe_graph.py` | Encrypted graph representation for CKKS |
+| `server/fhe_utils_ckks.py` | CKKS helpers (matmul, rotations, etc.) |
+| `server/utils.py` | CSV writer, RSS, TCP helpers |
+| `server/metrics.py` | Server-side MetricsRecorder (RSS, time) |
+| `server/metrics_pi.py` | Raspberry Pi metrics (power, energy) |
+| **Shared** | |
+| `openfhe_serializer.py` | Serialization for ciphertexts/keys across client–server |
+
+---
+
+## Prerequisites
 
 ```bash
 conda activate gat-fhe
@@ -39,41 +54,68 @@ Place dataset at:
 client_server/client/iot.csv
 ```
 
----
+### Dataset: iot.csv — 6 columns (edge-based)
+
+The CSV must have **6 columns**: **src_ip**, **dst_ip**, **src_bytes**, **dst_bytes**, **duration**, **label**. Each **row is one edge** (one communication).
+
+| Column       | Role |
+| ------------ | -----|
+| **src_ip**   | Source node (graph); unique IPs become node IDs |
+| **dst_ip**   | Destination node (graph) |
+| **src_bytes**| Edge feature (per row); StandardScaler-normalised |
+| **dst_bytes**| Edge feature (per row); StandardScaler-normalised |
+| **duration** | Edge feature (per row); StandardScaler-normalised |
+| **label**    | **Edge label** (0/1): target for training and evaluation; not an input feature |
+
+**Node features** (for GAT): structural only — **in-degree** and **out-degree** (2 dims), StandardScaler-normalised. **Edge features** (for edge head): **src_bytes**, **dst_bytes**, **duration** (3 dims). Train/test split is **by edge index** (e.g. 80% edges train, 20% test). Batches are **edge batches** (e.g. 60 edges per batch); `build_edge_batch()` builds the subgraph of nodes involved in those edges and the local edge index and edge features/labels.
 
 ---
 
-# PART 1 — Plaintext GAT Baseline
+# PART 1 — Plaintext GAT + Edge Head (Baseline)
 
 ---
 
-## Architecture Overview (Plaintext)
+## Why the Edge Head? Why a Second Layer for Prediction?
+
+The GAT layer is **node-level**: it takes node features and the graph and outputs **one embedding vector per node**. It does **not** output a score per edge. For **edge (link) prediction** we need **one scalar per edge** (e.g. “is this communication malicious?”).
+
+So we add an **edge head** — a second, small computation that turns **pairs of node embeddings** (and edge features) into **one score per edge**:
+
+- **Input**: For each edge `(src, dst)` we have GAT embeddings `h_src`, `h_dst` and edge features (e.g. src_bytes, dst_bytes, duration).
+- **Computation**: One linear layer: `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge`.
+- **Output**: One logit per edge → sigmoid for probability, then threshold for class.
+
+So the “second layer” is not another GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. The plaintext server runs both GAT and edge head (`PlainGATModelEdge`). In the FHE path, the server runs only the GAT (encrypted); the client decrypts node embeddings and runs the edge head in plaintext.
+
+---
+
+## Architecture Overview (Plaintext, Edge-Based)
 
 ```
 plain_client.py                          plain_server.py
 ────────────────                         ───────────────────────────
-load_and_preprocess_iot_csv()
-build_train_test_split()
-make_connected_batches()
+load_iot_edge_train_test()
+build_edge_batch()  (per edge batch)
 
 ── TRAINING ──
-for each batch:
-  build x_batch, edge_index_batch  ──b"G"──▶  compute_plain_training_batch()
-  send {x, edges, y, W, a,                      ├─ PlainGATModel.forward()
-        num_epochs, lr}                          ├─ BCEWithLogitsLoss
-                                                 ├─ Adam.step() × num_epochs
-  recv W_new, a_new, metrics_rows  ◀──────────  └─ per-epoch: loss, acc, time, RSS
+for each edge batch:
+  build x_batch, edge_index_batch,     ──b"G"──▶  compute_plain_training_batch_edge()
+  edge_feats_batch, y_edges_batch                 ├─ PlainGATModelEdge: GAT + edge head
+  send {x, edges, edge_feats, y_edges,            ├─ BCEWithLogitsLoss (edge labels)
+        W, a, edge_head_weight, edge_head_bias,   ├─ Adam.step() × num_epochs
+        num_epochs, lr}                            └─ per-epoch: loss, acc, time, RSS
+  recv W_new, a_new, edge_W_new,       ◀──────────
+       edge_b_new, metrics_rows
 
 ── INFERENCE ──
-for each test batch:
-  build x_batch, edge_index_batch  ──b"I"──▶  compute_plain_infer_batch()
-  send {x, edges, node_indices,                  └─ PlainGATModel.forward()
-        W, a}
-  recv logits, batch_metrics       ◀──────────
+for each test edge batch:
+  build x_batch, edge_index_batch,     ──b"I"──▶  compute_plain_infer_batch_edge()
+  edge_feats_batch                             └─ PlainGATModelEdge.forward() → edge logits
+  send {x, edges, edge_feats, W, a, edge_head_*}
+  recv logits (per edge), batch_metrics ◀──────────
 
-compute_classification_metrics()
-write plain_batch_metrics_<ts>.csv
-write plain_summary_<ts>.csv
+compute_classification_metrics()  (on edge labels)
+write plain_batch_metrics_<ts>.csv, plain_summary_<ts>.csv
 ```
 
 ### Training modes
@@ -85,9 +127,21 @@ write plain_summary_<ts>.csv
 | `--infer_only`    | Load saved weights, run inference — skip training  |
 | `--load_weights`  | Skip training, use saved `plain_weights.pt`        |
 
-### Batch construction — `make_connected_batches()`
+### Batch construction and how subgraphs are built (edge-based)
 
-Training nodes are partitioned using BFS from the highest-degree unvisited node. This guarantees every batch contains at least one edge — batches with zero edges produce degenerate softmax distributions and are silently skipped. The BFS ordering also clusters spatially close nodes together, meaning attention scores aggregate over real neighbours rather than random node collections.
+**Training batches**  
+Train **edges** are shuffled, then split into contiguous chunks of `--batch_size` **edges** (e.g. 60). Each chunk is one batch. No overlap: each edge appears in exactly one batch.
+
+**Subgraph for each batch** — `build_edge_batch(edge_ids, edge_index_full, edge_feats, edge_labels, x_nodes)`:
+
+1. Take the edges in this batch: `edge_index_full[:, edge_ids]`.
+2. Collect all **node IDs** that appear in those edges (source or target).
+3. Build **local** node features `x_batch = x_nodes[nodes_global]` and **local** edge index (remapping global node IDs to 0..num_nodes_batch-1).
+4. Slice edge features and edge labels for this batch.
+
+So each batch is a **small induced subgraph**: only the nodes that appear in the batch’s edges, plus the batch’s edges with local indices. GAT runs on this subgraph; the edge head gets one logit per edge in the batch.
+
+**Inference batches**: Same idea: test edges are split into chunks of `batch_size` edges; for each chunk we call `build_edge_batch()` and send the subgraph + edge features; server returns **edge logits** (one per edge in the batch).
 
 ---
 
@@ -105,9 +159,8 @@ python -m client_server.client.plain_client \
 Useful options:
 
 ```bash
---total_nodes 200   # cap dataset to 200 nodes (BFS-extracted connected subgraph)
+--max_edges 5000    # cap number of edges for quick runs
 --seed 42           # reproducible split
---f_in 5            # number of input features kept
 ```
 
 ---
@@ -180,61 +233,107 @@ The payload serialised over TCP is a `pickle` dict containing raw NumPy arrays (
 
 ---
 
-## Plaintext CSV Output
+## Metrics: Where to Find Them and What Each Field Means
+
+All metrics are written as **CSV only** (no `.txt` files). When client and server run on separate devices, you get **server-side** and **client-side** CSVs independently so you can analyse each side.
+
+### Standard CSV columns (all metrics files)
+
+Every metrics CSV uses the same core columns where applicable:
+
+| Column             | Meaning |
+| ----------------- | ------- |
+| `step`            | Name of the step or phase (e.g. `infer_batch_0`, `client_context_keygen`) |
+| `server_time`     | Time in **seconds** spent on the **server** for this step (0 if client-only) |
+| `client_time`     | Time in **seconds** spent on the **client** for this step (0 if server-only) |
+| `rss_after_bytes` | Resident set size (RAM) in bytes **after** the step |
+| `rss_delta_bytes` | Change in RSS in bytes during the step |
+| `power_watts`     | Power in **watts** (when available, e.g. from powercap) |
+| `energy_joules`   | Energy in **joules** for the step |
+| `throughput`      | Throughput for the step (e.g. 1/time = ops/sec, or nodes/sec for inference) |
+
+---
+
+### Plaintext: where metrics are written
+
+| File | Written by | When |
+| ---- | ---------- | ----- |
+| `plain_batch_metrics_<ts>.csv` | Client | After inference; one row per inference batch |
+| `plain_summary_<ts>.csv`       | Client | After run; Tserver, Ttotal, energy, throughput |
+| `server_train_metrics_<ts>.csv`| Server | After each train request (`b"T"` or `b"G"`) |
+| `server_infer_metrics_<ts>.csv`| Server | After each infer request (`b"I"`) |
+
+**Plain per-batch CSV columns:** `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`, `batch`, `nodes_in_batch`, `edges_in_batch`, `client_encryption_time` (0), `client_decryption_time` (0), `ciphertext_size_bytes` (0).
+
+**Plain summary CSV:** `Tserver`, `n_test_edges`, `Energy_total_J`, etc.
+
+---
+
+### FHE: where metrics are written
+
+| File | Written by | When |
+| ---- | ---------- | ----- |
+| `client_fhe_metrics_<ts>.csv`   | Client | End of run; one row per **client** phase (keygen, encrypt train, encrypt infer, encrypt_batch_*, decrypt_batch_*) |
+| `server_fhe_metrics_train_<ts>.csv` | Client | After training; aggregated server steps (from all training batches) |
+| `server_fhe_metrics_infer_<ts>.csv` | Client | After inference; one row per server step per inference batch |
+| `fhe_batch_metrics_<ts>.csv`   | Client | After inference; one row per inference batch (client + server combined) |
+| `fhe_summary_<ts>.csv`          | Client | End of run; Tenc, Tserver, Tdec, energy, throughput |
+| `server_fhe_train_metrics_<ts>.csv`  | Server | Per train connection (if server writes to disk) |
+| `server_fhe_infer_metrics_<ts>.csv`  | Server | Per infer connection |
+| `server_fhe_grad_metrics_<ts>.csv`   | Server | Per gradient-step connection |
+
+**Client metrics CSV** (`client_fhe_metrics_<ts>.csv`): Each row is a **client-side** phase. `client_time` is the time for that phase (key generation, encryption, decryption); `server_time` is 0. So you see which phase (keygen, encrypt train, encrypt_batch_0, decrypt_batch_0, etc.) took how long.
+
+**FHE per-batch CSV** (`fhe_batch_metrics_<ts>.csv`) columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`, `batch`, `nodes_in_batch`, `edges_in_batch`, `client_encryption_time`, `client_decryption_time`, **`ciphertext_size_bytes`** (total size of ciphertexts sent for that batch), `ct_x_batch_size_bytes`, `ct_W_list_size_bytes`, `total_ciphertext_batch_size_bytes`.
+
+---
+
+### Per-batch client fields (each batch, e.g. 60 edges)
+
+For **each batch** the client records:
+
+| Field | Meaning |
+| ----- | ------- |
+| `client_encryption_time` | Time in seconds to encrypt the batch (features + weights for FHE; 0 for plain) |
+| `client_decryption_time` | Time in seconds to decrypt the batch output (FHE only; 0 for plain) |
+| `ciphertext_size_bytes`  | Total size in bytes of ciphertexts sent for that batch (FHE); 0 for plain |
+| `ct_x_batch_size_bytes`  | Size of encrypted node-feature ciphertexts for the batch (FHE only) |
+| `ct_W_list_size_bytes`   | Size of encrypted weight ciphertexts (FHE only) |
+
+---
+
+## Plaintext CSV Output (legacy column names in server rows)
 
 ### Per-Epoch Training CSV (`server_train_metrics_<ts>.csv`)
 
-Written by the server for every `b"T"` or `b"G"` command:
-
-```
-phase,batch,epoch,seconds,rss_delta_bytes,rss_after_bytes,energy_joules,power_watts,loss,train_acc
-train_batch,0,1,0.0031,204800,48234496,0.0,0.0,0.6931,0.5200
-train_batch,0,2,0.0028,0,48234496,0.0,0.0,0.6714,0.5600
-...
-```
-
-Every epoch for every batch is a separate row — no aggregation on the server side.
+Written by the server for every `b"T"` or `b"G"` command. Rows are normalised to standard columns (`step`, `server_time`, `client_time`, `rss_*`, `power_watts`, `energy_joules`, `throughput`). Original per-epoch data includes `phase`, `batch`, `epoch`, `seconds` (mapped to `server_time`), `loss`, `train_acc`.
 
 ### Per-Batch Inference CSV (`server_infer_metrics_<ts>.csv`)
 
-Written by the server for every `b"I"` command:
-
-```
-phase,batch,epoch,seconds,rss_delta_bytes,rss_after_bytes,energy_joules,power_watts
-infer,0,,0.0012,0,48300032,0.0,0.0
-```
-
-### Client Summary CSV (`plain_batch_metrics_<ts>.csv`)
-
-Written by the client, one row per batch, combining train and infer phases:
-
-```
-phase,batch,nodes_in_batch,client_encryption_time,client_decryption_time,
-payload_size_bytes,server_time_seconds,server_rss_after_mb,
-server_energy_joules,server_power_watts
-```
+Written by the server for every `b"I"` command. Same standard columns; `server_time` holds the inference time.
 
 ### Energy / Latency Summary (`plain_summary_<ts>.csv`)
 
 ```
 Tserver,<seconds>
 Ttotal,<seconds>
-Energy_total,<joules>
-Energy_per_batch,<joules>
-Energy_per_node,<joules>
+Energy_total_J,<joules>
+Energy_per_batch_J,<joules>
+Energy_per_node_J,<joules>
+throughput_nodes_per_sec,<value>
 ```
 
 ---
 
 ---
 
-# PART 2 — CKKS FHE Secure GAT
+# PART 2 — CKKS FHE Secure GAT (Edge-Based)
 
 ---
 
-## Architecture Overview (FHE)
+## Architecture Overview (FHE, Edge-Based)
 
-The fundamental security property is that **the server never holds the secret key** and therefore never sees any plaintext — not features, not labels, not weights.
+The fundamental security property is that **the server never holds the secret key** and therefore never sees any plaintext — not features, not labels, not weights. The pipeline is **edge-based**: batches are **edge batches**; labels are **per edge**. The server runs only the **GAT** (encrypted); the **edge head** runs on the **client** after decryption (node embeddings → edge logits).
 
 ```
 client.py  (holds secret key)           server.py  (stateless compute)
@@ -246,32 +345,31 @@ create_client_context()
   └─ EvalRotKeyGen(sk, rotations)       
   └─ EvalBootstrapSetup(levelBudget)    
 
-encrypt_weight_matrix(W_init, F_in)     
+encrypt_weight_matrix(W_init, F_in)     F_in=2 (node), F_out=8 (embedding dim)
   → ct_W_list  (one ct per output row)  
 encrypt_node_features(x_batch, F_in)    
   → ct_x_batch (one ct per node)        
 
-── TRAINING (b"G" per batch) ──
+── TRAINING (b"G" per edge batch) ──
+  Derive node labels from edge labels (per batch)
 send {cc, pk, ct_W_list, a,     ──▶     compute_fhe_training_batch()
-      ct_x, ct_labels,                    ├─ GATEncoderCKKS.forward()
-      edge_index, num_epochs, lr}         ├─ FHE linear projection
-                                          ├─ FHE attention scores
-recv ct_W_list_new, metrics     ◀──      ├─ Polynomial LeakyReLU
-                                          ├─ Polynomial softmax (streaming)
-                                          ├─ FHE aggregation
-                                          ├─ Encrypted gradient + Adam step
-                                          └─ EvalBootstrap(ct_W) if level low
+      ct_x, ct_labels (node-derived),   ├─ GATEncoderCKKS.forward()
+      edge_index, num_epochs, lr}        ├─ FHE linear, attention, softmax, aggregation
+recv ct_W_list_new, metrics     ◀──     ├─ Encrypted gradient + Adam step
+                                         └─ EvalBootstrap(ct_W) if level low
+  After all batches: decrypt W. Then train edge head on client (FHE forward on
+  train batches → decrypt embeddings → fit LogisticRegression on [h_src; h_dst; edge_feats]).
 
-── INFERENCE (b"I" per batch) ──
+── INFERENCE (b"I" per edge batch) ──
 send {cc, pk, ct_W_list, a,     ──▶     compute_forward_only()
-      ct_x, edge_index}                   ├─ full GAT forward pass
-                                          └─ EvalBootstrap(out_cts) if level low
-recv ct_out, metrics            ◀──
+      ct_x, edge_index}                   ├─ full GAT forward pass (node embeddings)
+recv ct_out (node embeddings),   ◀──     └─ EvalBootstrap(out_cts) if level low
+      metrics
 
-Decrypt(sk, ct_out) → logits             
-compute_classification_metrics()
-write fhe_batch_metrics_<ts>.csv
-write fhe_summary_<ts>.csv
+Decrypt(sk, ct_out) → node embeddings (N_batch, F_out)
+For each edge (src,dst): logit = edge_head @ [h_src; h_dst; edge_feats]
+compute_classification_metrics()  (on edge labels)
+write fhe_batch_metrics_<ts>.csv, fhe_summary_<ts>.csv
 ```
 
 ### Client-Side Key Generation and Encryption
@@ -575,28 +673,17 @@ TCP socket is opened with `TCP_NODELAY` enabled (`IPPROTO_TCP, TCP_NODELAY = 1`)
 
 ---
 
-## FHE CSV Output
+## FHE CSV Output (standard columns)
+
+All FHE metrics use the same standard columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`. Server-side rows have `client_time=0`; client-side rows have `server_time=0`.
 
 ### Server-Side Training CSV (`server_fhe_train_metrics_<ts>.csv` / `server_fhe_grad_metrics_<ts>.csv`)
 
-```
-phase,seconds,rss_delta_bytes,rss_after_bytes,energy_joules,power_watts
-fhe_linear_proj,1.8432,2097152,512000000,0.0,0.0
-fhe_attention_scores,3.1204,0,512000000,0.0,0.0
-fhe_leakyrelu_poly,0.9812,0,512000000,0.0,0.0
-fhe_softmax_approx,1.2340,0,512000000,0.0,0.0
-fhe_aggregation,2.0011,0,512000000,0.0,0.0
-fhe_output_bootstrap,4.5521,0,512000000,0.0,0.0
-fhe_training_total,13.8401,0,512000000,0.0,0.0
-```
+Each row is a server step; `server_time` is the step duration, `client_time` is 0. Example step names: `batch_0_1_linear`, `batch_0_2_attention`, `batch_0_3_leakyrelu`, `batch_0_epoch_1_forward_backward_stream`, `batch_0_epoch_1_weight_update`, `batch_0_epoch_1_bootstrap_weights`, `batch_0_fhe_output_bootstrap`.
 
 ### Client-Side FHE Batch CSV (`fhe_batch_metrics_<ts>.csv`)
 
-```
-batch,nodes_in_batch,client_encryption_time,client_decryption_time,
-ct_x_batch_size_bytes,ct_W_list_size_bytes,total_ciphertext_batch_size_bytes,
-server_time_seconds,server_rss_after_mb,server_energy_joules,server_power_watts
-```
+One row per inference batch. Columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`, `batch`, `nodes_in_batch`, `client_encryption_time`, `client_decryption_time`, **`ciphertext_size_bytes`** (total ciphertext size for the batch), `ct_x_batch_size_bytes`, `ct_W_list_size_bytes`, `total_ciphertext_batch_size_bytes`.
 
 ### FHE Summary CSV (`fhe_summary_<ts>.csv`)
 
@@ -605,9 +692,10 @@ Tenc,<seconds>
 Tserver,<seconds>
 Tdec,<seconds>
 Ttotal,<seconds>
-Energy_total,<joules>
-Energy_per_batch,<joules>
-Energy_per_node,<joules>
+Energy_total_J,<joules>
+Energy_per_batch_J,<joules>
+Energy_per_node_J,<joules>
+throughput_nodes_per_sec,<value>
 ```
 
 ---
@@ -642,7 +730,7 @@ Server CSV files are written immediately after each request completes using a ti
 
 ---
 
-# 📡 TCP Transport Layer
+# TCP Transport Layer
 
 Both modes use the same length-prefixed framing protocol:
 
@@ -665,17 +753,16 @@ Status byte convention (server → client):
 
 ---
 
-# 📈 Scalability Testing
+# Scalability Testing
 
 ```bash
-# Vary batch size to observe latency / energy / RSS trade-offs
+# Vary batch size (edges per batch)
 --batch_size 30
 --batch_size 60
 --batch_size 120
 
-# Vary dataset size
---total_nodes 100
---total_nodes 500
+# Cap edges for quick runs
+--max_edges 5000
 
 # Vary training depth
 --epochs 3
@@ -684,14 +771,14 @@ Status byte convention (server → client):
 
 Expected observations:
 
-- **Latency**: roughly linear in `batch_size × F_in` for plaintext; roughly linear in `batch_size` for FHE (dominated by EvalBootstrap)
-- **Energy per node**: decreases with larger batches (fixed-cost amortised)
+- **Latency**: roughly linear in `batch_size` (edges) for both plain and FHE; FHE dominated by EvalBootstrap
+- **Energy per batch**: decreases with larger batches (fixed-cost amortised)
 - **RSS growth**: bounded by `del` / GC pattern — does not grow across batches
 - **Network payload**: dominated by the serialised CryptoContext (~10–50 MB) in FHE mode; dominated by feature arrays in plaintext mode
 
 ---
 
-# 🛠 Troubleshooting
+# Troubleshooting
 
 ## Connection Refused
 

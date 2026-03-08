@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Plaintext GAT server: raw TCP transport (no FHE).
+Plaintext GAT server: raw TCP transport (no FHE). Edge-based (link) prediction only.
 
-Mirrors the FHE server's two-command protocol:
-  b'T'  ->  train   (recv training graph, run GAT training, return weights + metrics)
-  b'I'  ->  infer   (recv node batch + weights, run forward pass, return predictions + metrics)
-
-Per-epoch metrics are recorded during training.
-Per-batch metrics are recorded during inference.
-All server-side metrics are written to  server_metrics_<timestamp>.txt
+  b'G'  ->  gradient step  (recv edge batch, run GAT + edge head training, return weights + metrics)
+  b'I'  ->  infer          (recv edge batch + weights, run forward, return edge logits + metrics)
 
 Usage:
   python plain_server.py --host 0.0.0.0 --port 9998
 
 In-process API:
-  from plain_server import compute_plain_training, compute_plain_infer
+  from plain_server import compute_plain_training_batch_edge, compute_plain_infer_batch_edge
 """
 
 from __future__ import annotations
@@ -22,7 +17,6 @@ from __future__ import annotations
 import os
 import pickle
 import socket
-import struct
 import sys
 import threading
 import time
@@ -36,51 +30,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import csv
-
-def _write_metrics_csv(path: str, rows: list[dict]) -> None:
-    if not rows:
-        return
-
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"[server] metrics written → {path}")
-
-# ── RSS / energy helpers (same as metrics.py) ────────────────────────────────
-
-def _rss_bytes() -> int:
-    try:
-        with open("/proc/self/status", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1]) * 1024
-    except OSError:
-        pass
-    try:
-        import resource
-        return int(getattr(resource.getrusage(resource.RUSAGE_SELF), "ru_maxrss", 0)) * 1024
-    except Exception:
-        return 0
-
-
-def _energy_uj() -> Optional[int]:
-    try:
-        base = "/sys/class/powercap"
-        if not os.path.isdir(base):
-            return None
-        for entry in sorted(os.listdir(base)):
-            path = os.path.join(base, entry, "energy_uj")
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return int(f.read().strip())
-    except Exception:
-        return None
-    return None
+from .utils import (
+    energy_uj,
+    rss_bytes,
+    recv_frame,
+    send_error,
+    send_frame,
+    send_ok,
+    write_metrics_csv,
+)
 
 
 @dataclass
@@ -104,14 +62,14 @@ class _Timer:
 
     def __enter__(self):
         self._t0 = time.perf_counter()
-        self._rss0 = _rss_bytes()
-        self._e0 = _energy_uj()
+        self._rss0 = rss_bytes()
+        self._e0 = energy_uj()
         return self
 
     def __exit__(self, *_):
         t1 = time.perf_counter()
-        rss1 = _rss_bytes()
-        e1 = _energy_uj()
+        rss1 = rss_bytes()
+        e1 = energy_uj()
         dt = float(t1 - (self._t0 or t1))
         energy_j = 0.0
         power_w = 0.0
@@ -127,37 +85,6 @@ class _Timer:
             power_watts=power_w,
             extra=self.extra,
         )
-
-
-# ── TCP framing ───────────────────────────────────────────────────────────────
-
-def _recvall(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Connection closed mid-receive")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def _send_frame(sock: socket.socket, data: bytes) -> None:
-    sock.sendall(struct.pack(">I", len(data)) + data)
-
-
-def _recv_frame(sock: socket.socket) -> bytes:
-    raw_len = _recvall(sock, 4)
-    length = struct.unpack(">I", raw_len)[0]
-    return _recvall(sock, length)
-
-
-def _send_ok(sock: socket.socket) -> None:
-    sock.sendall(b"\x00")
-
-
-def _send_error(sock: socket.socket, exc: Exception) -> None:
-    msg = str(exc).encode()
-    sock.sendall(b"\x01" + struct.pack(">I", len(msg)) + msg)
 
 
 # ── Plain GAT model ───────────────────────────────────────────────────────────
@@ -226,78 +153,102 @@ class PlainGATLayer(nn.Module):
         return out
 
 
-class PlainGATModel(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int,
-                 negative_slope: float = 0.2):
+class PlainGATModelEdge(nn.Module):
+    """
+    GAT + edge classifier head for link/edge prediction.
+    Node features -> GAT -> node embeddings; then edge logits = MLP(concat(h_src, h_dst, edge_feats)).
+    """
+    def __init__(
+        self,
+        node_in_dim: int,
+        hidden_dim: int,
+        edge_feat_dim: int,
+        negative_slope: float = 0.2,
+    ):
         super().__init__()
-        self.gat = PlainGATLayer(in_channels, out_channels, negative_slope)
+        self.node_in_dim = node_in_dim
+        self.hidden_dim = hidden_dim
+        self.edge_feat_dim = edge_feat_dim
+        self.gat = PlainGATLayer(node_in_dim, hidden_dim, negative_slope)
+        self.edge_head = nn.Linear(2 * hidden_dim + edge_feat_dim, 1)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        return self.gat(x, edge_index)
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        h = self.gat(x, edge_index)  # (N, hidden_dim)
+        src, dst = edge_index[0], edge_index[1]
+        edge_repr = torch.cat([h[src], h[dst], edge_feats], dim=-1)  # (E, 2*hidden + edge_feat)
+        return self.edge_head(edge_repr).squeeze(-1)  # (E,)
 
-    def load_weights(self, W_np: np.ndarray, a_np: np.ndarray) -> None:
+    def load_weights(
+        self,
+        W_np: np.ndarray,
+        a_np: np.ndarray,
+        edge_W_np: np.ndarray,
+        edge_b_np: np.ndarray,
+    ) -> None:
         self.gat.load_weights(W_np, a_np)
+        with torch.no_grad():
+            self.edge_head.weight.copy_(torch.tensor(edge_W_np, dtype=torch.float32))
+            self.edge_head.bias.copy_(torch.tensor(edge_b_np, dtype=torch.float32))
 
-    def get_weights(self) -> Tuple[np.ndarray, np.ndarray]:
-        return self.gat.get_weights()
+    def get_weights(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        W, a = self.gat.get_weights()
+        edge_W = self.edge_head.weight.detach().cpu().numpy()
+        edge_b = self.edge_head.bias.detach().cpu().numpy()
+        return W, a, edge_W, edge_b
 
 
+# ── Core compute functions (edge-based only) ───────────────────────────────────
 
-# ── Core compute functions ────────────────────────────────────────────────────
-
-def compute_plain_training_batch(
+def compute_plain_training_batch_edge(
     *,
-    x_batch,
-    edge_index_batch,
-    y_batch,
-    in_channels,
-    out_channels,
-    W,
-    a,
-    num_epochs,
-    negative_slope=0.2,
-    lr=0.01,
-):
+    x_batch: np.ndarray,
+    edge_index_batch: np.ndarray,
+    edge_feats_batch: np.ndarray,
+    y_edges_batch: np.ndarray,
+    node_in_dim: int,
+    hidden_dim: int,
+    edge_feat_dim: int,
+    W: np.ndarray,
+    a: np.ndarray,
+    edge_head_weight: np.ndarray,
+    edge_head_bias: np.ndarray,
+    num_epochs: int = 3,
+    negative_slope: float = 0.2,
+    lr: float = 0.01,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
     """
-    Perform num_epochs gradient steps on a subgraph batch.
-    Returns updated weights and per-epoch metric rows.
+    Train one edge-batch: GAT + edge classifier; loss on edge labels.
+    Returns W_new, a_new, edge_head_weight_new, edge_head_bias_new, metrics_rows.
     """
-    model = PlainGATModel(in_channels, out_channels, negative_slope)
-    model.load_weights(W, a)
+    model = PlainGATModelEdge(node_in_dim, hidden_dim, edge_feat_dim, negative_slope)
+    model.load_weights(W, a, edge_head_weight, edge_head_bias)
 
     x_t = torch.tensor(x_batch, dtype=torch.float32)
     ei_t = torch.tensor(edge_index_batch, dtype=torch.long)
-    y_t = torch.tensor(y_batch, dtype=torch.float32)
+    ef_t = torch.tensor(edge_feats_batch, dtype=torch.float32)
+    y_t = torch.tensor(y_edges_batch, dtype=torch.float32)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # Initialise so we always have valid weights to return even if num_epochs==0
-    W_new, a_new = W, a
-
-    epoch_metrics: List[Dict] = []
+    metrics_rows: List[Dict] = []
 
     for epoch in range(1, num_epochs + 1):
         extra: Dict[str, Any] = {}
         with _Timer(f"epoch_{epoch:03d}", extra) as timer:
             model.train()
             optimizer.zero_grad()
-
-            out = model(x_t, ei_t)
-            logits = out[:, 0]
-
+            logits = model(x_t, ei_t, ef_t)
             pos_weight = torch.tensor(
-                [(len(y_batch) - np.sum(y_batch)) / (np.sum(y_batch) + 1e-6)],
+                [(len(y_edges_batch) - np.sum(y_edges_batch)) / (np.sum(y_edges_batch) + 1e-6)],
                 dtype=torch.float32,
             )
-
-            loss = F.binary_cross_entropy_with_logits(
-                logits,
-                y_t,
-                pos_weight=pos_weight,
-            )
+            loss = F.binary_cross_entropy_with_logits(logits, y_t, pos_weight=pos_weight)
             loss.backward()
             optimizer.step()
-
             with torch.no_grad():
                 preds = (torch.sigmoid(logits) > 0.5).long()
                 correct = (preds == y_t.long()).float().mean().item()
@@ -305,7 +256,9 @@ def compute_plain_training_batch(
             extra["train_acc"] = float(correct)
 
         m = timer.metric
-        epoch_metrics.append({
+        metrics_rows.append({
+            "phase": "train_batch",
+            "batch": 0,
             "epoch": epoch,
             "seconds": m.seconds,
             "rss_delta_bytes": m.rss_delta_bytes,
@@ -316,149 +269,39 @@ def compute_plain_training_batch(
             "train_acc": extra.get("train_acc", 0.0),
         })
 
-        W_new, a_new = model.get_weights()
+    W_new, a_new, edge_W_new, edge_b_new = model.get_weights()
+    return W_new, a_new, edge_W_new, edge_b_new, metrics_rows
 
-    # Build metrics_rows list — accumulate ALL epochs (was erroneously overwriting)
-    metrics_rows: List[Dict] = []
-    for m_dict in epoch_metrics:
-        metrics_rows.append({
-            "phase": "train_batch",
-            "batch": 0,
-            "epoch": m_dict["epoch"],
-            "seconds": m_dict["seconds"],
-            "rss_delta_bytes": m_dict["rss_delta_bytes"],
-            "rss_after_bytes": m_dict["rss_after_bytes"],
-            "energy_joules": m_dict["energy_joules"],
-            "power_watts": m_dict["power_watts"],
-            "loss": m_dict.get("loss", 0.0),
-            "train_acc": m_dict.get("train_acc", 0.0),
-        })
 
-    return W_new, a_new, metrics_rows
-
-def compute_plain_training(
+def compute_plain_infer_batch_edge(
     *,
-    x_train: np.ndarray,          # (N_train, F_in)
-    edge_index_train: np.ndarray, # (2, E_train)
-    y_train: np.ndarray,          # (N_train,)
-    train_mask: np.ndarray,       # (N_train,) bool
-    in_channels: int,
-    out_channels: int,
-    W_init: np.ndarray,
-    a_init: np.ndarray,
-    negative_slope: float = 0.2,
-    num_epochs: int = 3,
-    lr: float = 0.01,
-    print_metrics: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, List[Dict]]:
-    """
-    Train a 1-layer plaintext GAT for num_epochs.
-
-    Returns:
-        W_trained (np.ndarray), a_trained (np.ndarray),
-        epoch_metrics (list of dicts, one per epoch)
-    """
-    model = PlainGATModel(in_channels, out_channels, negative_slope)
-    model.load_weights(W_init, a_init)
-
-    x_t = torch.tensor(x_train, dtype=torch.float32)
-    ei_t = torch.tensor(edge_index_train, dtype=torch.long)
-    y_t = torch.tensor(y_train, dtype=torch.float32)
-    mask = torch.tensor(train_mask, dtype=torch.bool)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    epoch_metrics: List[Dict] = []
-
-    for epoch in range(1, num_epochs + 1):
-        extra: Dict[str, Any] = {}
-        with _Timer(f"epoch_{epoch:03d}", extra) as timer:
-            model.train()
-            optimizer.zero_grad()
-            out = model(x_t, ei_t)          # (N, out_channels)
-            logits = out[mask, 0]           # binary: single output channel
-            loss = F.binary_cross_entropy_with_logits(logits, y_t[mask])
-            loss.backward()
-            optimizer.step()
-
-            with torch.no_grad():
-                preds = (torch.sigmoid(logits) > 0.5).long()
-                correct = (preds == y_t[mask].long()).float().mean().item()
-            extra["loss"] = float(loss.item())
-            extra["train_acc"] = float(correct)
-
-        m = timer.metric
-        epoch_metrics.append({
-            "epoch": epoch,
-            "seconds": m.seconds,
-            "rss_delta_bytes": m.rss_delta_bytes,
-            "rss_after_bytes": m.rss_after_bytes,
-            "energy_joules": m.energy_joules,
-            "power_watts": m.power_watts,
-            "loss": extra["loss"],
-            "train_acc": extra["train_acc"],
-        })
-
-        if print_metrics:
-            mb_after = m.rss_after_bytes / (1024 * 1024)
-            dmb = m.rss_delta_bytes / (1024 * 1024)
-            print(
-                f"  [server] epoch {epoch:3d}/{num_epochs}  "
-                f"loss={extra['loss']:.4f}  acc={extra['train_acc']:.4f}  "
-                f"t={m.seconds:.4f}s  "
-                f"RSS Δ{dmb:+.2f}MB  RSS {mb_after:.2f}MB  "
-                f"power={m.power_watts:.4f}W"
-            )
-    metrics_rows = []
-
-    for m in epoch_metrics:
-        metrics_rows.append({
-            "phase": "train",
-            "batch": "",
-            "epoch": m["epoch"],
-            "seconds": m["seconds"],
-            "rss_delta_bytes": m["rss_delta_bytes"],
-            "rss_after_bytes": m["rss_after_bytes"],
-            "energy_joules": m["energy_joules"],
-            "power_watts": m["power_watts"],
-        })
-
-    W_trained, a_trained = model.get_weights()
-    return W_trained, a_trained, metrics_rows
-
-
-def compute_plain_infer_batch(
-    *,
-    x_batch: np.ndarray,           # (B, F_in)  — full sub-graph features
-    edge_index_batch: np.ndarray,  # (2, E_batch)
-    node_indices: np.ndarray,      # which rows of x_batch to return predictions for
-    in_channels: int,
-    out_channels: int,
+    x_batch: np.ndarray,
+    edge_index_batch: np.ndarray,
+    edge_feats_batch: np.ndarray,
+    node_in_dim: int,
+    hidden_dim: int,
+    edge_feat_dim: int,
     W: np.ndarray,
     a: np.ndarray,
+    edge_head_weight: np.ndarray,
+    edge_head_bias: np.ndarray,
     negative_slope: float = 0.2,
     batch_id: int = 0,
 ) -> Tuple[np.ndarray, Dict]:
-    """
-    Run one forward pass on a batch of nodes.
-
-    Returns:
-        logits (np.ndarray, shape (len(node_indices),)),
-        batch_metrics (dict)
-    """
-    model = PlainGATModel(in_channels, out_channels, negative_slope)
-    model.load_weights(W, a)
+    """Run forward on an edge batch; return logits per edge (E_batch,) and metrics."""
+    model = PlainGATModelEdge(node_in_dim, hidden_dim, edge_feat_dim, negative_slope)
+    model.load_weights(W, a, edge_head_weight, edge_head_bias)
     model.eval()
 
     x_t = torch.tensor(x_batch, dtype=torch.float32)
     ei_t = torch.tensor(edge_index_batch, dtype=torch.long)
+    ef_t = torch.tensor(edge_feats_batch, dtype=torch.float32)
 
     with _Timer(f"batch_{batch_id:04d}") as timer, torch.no_grad():
-        out = model(x_t, ei_t)
-        logits = out[node_indices, 0].cpu().numpy()
+        logits = model(x_t, ei_t, ef_t)
+        logits = logits.cpu().numpy()
 
     m = timer.metric
-    # Return flat dict — easier for client to access .get("seconds", ...) directly
     batch_metrics = {
         "batch": batch_id,
         "seconds": m.seconds,
@@ -486,56 +329,26 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
         with conn:
             cmd = conn.recv(1)
 
-            # ── TRAIN ──────────────────────────────────────────────────────
-            if cmd == b"T":
-                raw = _recv_frame(conn)
+            if cmd == b"I":
+                raw = recv_frame(conn)
                 payload: Dict = pickle.loads(raw)
 
                 try:
-                    W_trained, a_trained, metrics_rows = compute_plain_training(
-                        x_train=np.asarray(payload["x_train"], dtype=np.float64),
-                        edge_index_train=np.asarray(payload["edge_index_train"], dtype=np.int64),
-                        y_train=np.asarray(payload["y_train"], dtype=np.float64),
-                        train_mask=np.asarray(payload["train_mask"], dtype=bool),
-                        in_channels=int(payload["in_channels"]),
-                        out_channels=int(payload["out_channels"]),
-                        W_init=np.asarray(payload["W_init"], dtype=np.float64),
-                        a_init=np.asarray(payload["a_init"], dtype=np.float64),
-                        negative_slope=float(payload.get("negative_slope", 0.2)),
-                        num_epochs=int(payload.get("epochs", 5)),
-                        lr=float(payload.get("lr", 0.01)),
-                        print_metrics=bool(payload.get("print_metrics", True)),
-                    )
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    _write_metrics_csv(f"server_train_metrics_{ts}.csv", metrics_rows)
-                    result = {"W_trained": W_trained, "a_trained": a_trained,
-                              "metrics": metrics_rows, "ok": True}
-                    _send_ok(conn)
-                    _send_frame(conn, pickle.dumps(result))
-
-                except Exception as exc:
-                    traceback.print_exc()
-                    _send_error(conn, exc)
-
-            # ── INFER (single batch) ───────────────────────────────────────
-            elif cmd == b"I":
-                raw = _recv_frame(conn)
-                payload: Dict = pickle.loads(raw)
-
-                try:
-                    logits, batch_metrics = compute_plain_infer_batch(
+                    logits, batch_metrics = compute_plain_infer_batch_edge(
                         x_batch=np.asarray(payload["x_batch"], dtype=np.float64),
                         edge_index_batch=np.asarray(payload["edge_index_batch"], dtype=np.int64),
-                        node_indices=np.asarray(payload["node_indices"], dtype=np.int64),
-                        in_channels=int(payload["in_channels"]),
-                        out_channels=int(payload["out_channels"]),
+                        edge_feats_batch=np.asarray(payload["edge_feats_batch"], dtype=np.float64),
+                        node_in_dim=int(payload["node_in_dim"]),
+                        hidden_dim=int(payload["hidden_dim"]),
+                        edge_feat_dim=int(payload["edge_feat_dim"]),
                         W=np.asarray(payload["W"], dtype=np.float64),
                         a=np.asarray(payload["a"], dtype=np.float64),
+                        edge_head_weight=np.asarray(payload["edge_head_weight"], dtype=np.float64),
+                        edge_head_bias=np.asarray(payload["edge_head_bias"], dtype=np.float64),
                         negative_slope=float(payload.get("negative_slope", 0.2)),
                         batch_id=int(payload.get("batch_id", 0)),
                     )
 
-                    # Build metrics_rows from the returned flat batch_metrics dict
                     infer_metrics_rows = [{
                         "phase": "infer",
                         "batch": batch_metrics.get("batch", 0),
@@ -547,41 +360,43 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                         "power_watts": batch_metrics.get("power_watts", 0.0),
                     }]
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    _write_metrics_csv(f"server_infer_metrics_{ts}.csv", infer_metrics_rows)
+                    write_metrics_csv(f"server_infer_metrics_{ts}.csv", infer_metrics_rows)
 
                     result = {
                         "logits": logits,
                         "metrics": batch_metrics,
                         "ok": True
                     }
-                    _send_ok(conn)
-                    _send_frame(conn, pickle.dumps(result))
+                    send_ok(conn)
+                    send_frame(conn, pickle.dumps(result))
 
                 except Exception as exc:
                     traceback.print_exc()
-                    _send_error(conn, exc)
+                    send_error(conn, exc)
             elif cmd == b"G":
-                raw = _recv_frame(conn)
+                raw = recv_frame(conn)
                 payload = pickle.loads(raw)
-
-                W_new, a_new, metrics_rows = compute_plain_training_batch(
-                    x_batch=payload["x_batch"],
-                    edge_index_batch=payload["edge_index_batch"],
-                    y_batch=payload["y_batch"],
-                    in_channels=payload["in_channels"],
-                    out_channels=payload["out_channels"],
-                    W=payload["W"],
-                    a=payload["a"],
+                W_new, a_new, edge_W_new, edge_b_new, metrics_rows = compute_plain_training_batch_edge(
+                    x_batch=np.asarray(payload["x_batch"], dtype=np.float64),
+                    edge_index_batch=np.asarray(payload["edge_index_batch"], dtype=np.int64),
+                    edge_feats_batch=np.asarray(payload["edge_feats_batch"], dtype=np.float64),
+                    y_edges_batch=np.asarray(payload["y_edges_batch"], dtype=np.float64),
+                    node_in_dim=int(payload["node_in_dim"]),
+                    hidden_dim=int(payload["hidden_dim"]),
+                    edge_feat_dim=int(payload["edge_feat_dim"]),
+                    W=np.asarray(payload["W"], dtype=np.float64),
+                    a=np.asarray(payload["a"], dtype=np.float64),
+                    edge_head_weight=np.asarray(payload["edge_head_weight"], dtype=np.float64),
+                    edge_head_bias=np.asarray(payload["edge_head_bias"], dtype=np.float64),
                     num_epochs=payload.get("num_epochs", payload.get("epochs", 1)),
-                    negative_slope=payload["negative_slope"],
-                    lr=payload["lr"],
+                    negative_slope=float(payload.get("negative_slope", 0.2)),
+                    lr=float(payload.get("lr", 0.01)),
                 )
-
-                result = {"W": W_new, "a": a_new, "metrics": metrics_rows}
+                result = {"W": W_new, "a": a_new, "edge_head_weight": edge_W_new, "edge_head_bias": edge_b_new, "metrics": metrics_rows}
                 ts = time.strftime("%Y%m%d_%H%M%S")
-                _write_metrics_csv(f"server_train_metrics_{ts}.csv", metrics_rows)
-                _send_ok(conn)
-                _send_frame(conn, pickle.dumps(result))
+                write_metrics_csv(f"server_train_metrics_{ts}.csv", result.get("metrics", []))
+                send_ok(conn)
+                send_frame(conn, pickle.dumps(result))
             else:
                 print(f"[server] unknown command {cmd!r}", file=sys.stderr)
 
@@ -602,7 +417,7 @@ def serve(host: str = "127.0.0.1", port: int = 9998) -> None:
         srv.bind((host, port))
         srv.listen(8)
         print(f"[server] Plaintext GAT server listening on {host}:{port}")
-        print("[server]  command b'T' -> train  |  b'I' -> infer (per batch)")
+        print("[server]  b'G' -> gradient step (edge batch)  |  b'I' -> infer (edge batch)")
         try:
             while True:
                 conn, addr = srv.accept()

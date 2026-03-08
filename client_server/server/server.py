@@ -38,40 +38,10 @@ if str(ROOT) not in sys.path:
 from .encoder_ckks import GATEncoderCKKS
 from .fhe_graph import FHEGraph
 
-# from .runner_ckks import run_gat_pipeline_fhe_training, run_gat_forward_only
-from .gpt_runner import run_gat_pipeline_fhe_training, run_gat_forward_only
+from .ckks_runner import run_gat_forward_only, run_gat_pipeline_fhe_training
 # from .metrics import MetricsRecorder
 from .metrics_pi import MetricsRecorder
-
-
-import csv
-
-
-def _write_metrics_csv(path: str, metrics_dict: dict) -> None:
-    rows = []
-
-    for name, m in metrics_dict.items():
-        rows.append(
-            {
-                "phase": name,
-                "seconds": m.get("seconds", 0.0),
-                "rss_delta_bytes": m.get("rss_delta_bytes", 0),
-                "rss_after_bytes": m.get("rss_after_bytes", 0),
-                "energy_joules": m.get("energy_joules", 0.0),
-                "power_watts": m.get("power_watts", 0.0),
-            }
-        )
-
-    if rows:
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-
-        print(f"[server] metrics written → {path}")
-
-
-# ── Bootstrap helper (public-key only, usable on server) ─────────────────
+from .utils import rss_bytes, write_metrics_csv
 
 
 def _bootstrap_output_cts(
@@ -84,24 +54,9 @@ def _bootstrap_output_cts(
     Conditionally bootstrap output ciphertexts based on remaining level.
     Now records real RSS delta.
     """
-
-    import time
     import sys as _sys
 
-    # ---- Real memory measurement ----
-    def _rss_bytes() -> int:
-        """Return resident set size in bytes (Linux)."""
-        try:
-            with open("/proc/self/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        parts = line.split()
-                        return int(parts[1]) * 1024  # kB → bytes
-        except Exception:
-            return 0
-        return 0
-
-    rss_before = _rss_bytes()
+    rss_before = rss_bytes()
     t0 = time.perf_counter()
 
     refreshed = []
@@ -130,7 +85,7 @@ def _bootstrap_output_cts(
         refreshed.append(ct)
 
     elapsed = time.perf_counter() - t0
-    rss_after = _rss_bytes()
+    rss_after = rss_bytes()
 
     rss_delta = rss_after - rss_before
 
@@ -441,7 +396,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     out_cts, metrics, ct_W_trained = compute_fhe_training(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    _write_metrics_csv(f"server_fhe_train_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_train_metrics_{ts}.csv", metrics)
                     send_ok(conn)
                     send_train_result(conn, out_cts, metrics, ct_W_trained)
                 except Exception as exc:
@@ -457,7 +412,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     out_cts, metrics = compute_forward_only(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    _write_metrics_csv(f"server_fhe_infer_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_infer_metrics_{ts}.csv", metrics)
                     send_ok(conn)
                     send_infer_result(conn, out_cts, metrics)
                 except Exception as exc:
@@ -478,7 +433,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 try:
                     ct_W_new, metrics = compute_fhe_training_batch(**payload)
                     ts = time.strftime("%Y%m%d_%H%M%S")
-                    _write_metrics_csv(f"server_fhe_grad_metrics_{ts}.csv", metrics)
+                    write_metrics_csv(f"server_fhe_grad_metrics_{ts}.csv", metrics)
                     send_ok(conn)
                     send_gradient_step_result(conn, ct_W_new, metrics)
                 except Exception as exc:

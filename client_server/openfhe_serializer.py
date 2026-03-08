@@ -541,6 +541,8 @@ def save_trained_weights(
     slots: int,
     F_in: int,
     F_out: int,
+    edge_head_weight=None,
+    edge_head_bias=None,
 ) -> None:
     import json
     import os
@@ -563,6 +565,11 @@ def save_trained_weights(
 
     # Save plaintext attention vector
     np.save(os.path.join(save_dir, "a.npy"), np.asarray(a, dtype=np.float64))
+
+    if edge_head_weight is not None:
+        np.save(os.path.join(save_dir, "edge_head_weight.npy"), np.asarray(edge_head_weight, dtype=np.float64))
+    if edge_head_bias is not None:
+        np.save(os.path.join(save_dir, "edge_head_bias.npy"), np.asarray(edge_head_bias, dtype=np.float64))
 
     print(f"[weights] saved plaintext weights → {save_dir}")
 
@@ -617,10 +624,19 @@ def load_trained_weights(save_dir: str) -> dict:
     W_list = np.load(W_path)
     a = np.load(a_path)
 
-    return {
+    out = {
         "W_list": W_list,
         "a": a,
         "slots": slots,
         "F_in": F_in,
         "F_out": F_out,
     }
+
+    edge_head_weight_path = os.path.join(save_dir, "edge_head_weight.npy")
+    edge_head_bias_path = os.path.join(save_dir, "edge_head_bias.npy")
+    if os.path.exists(edge_head_weight_path):
+        out["edge_head_weight"] = np.load(edge_head_weight_path)
+    if os.path.exists(edge_head_bias_path):
+        out["edge_head_bias"] = np.load(edge_head_bias_path)
+
+    return out

@@ -2,50 +2,70 @@
 
 ## Overview
 
-**Status**: ✅ **COMPLETE** - Fully-encrypted Graph Attention Network (GAT) encoder
+**Status**: ✅ **COMPLETE** — Fully-encrypted Graph Attention Network (GAT) in a **client–server** layout
 
-This project implements a **single-layer GAT encoder** with **100% encrypted operations** using OpenFHE Python (CKKS + FHEW/CGGI schemes). All intermediate computations are performed on encrypted data with **zero plaintext exposure** during inference.
+This project implements a **single-layer GAT encoder** with **100% encrypted operations** using OpenFHE Python (**CKKS only** in the current codebase). The server never holds the secret key; the client encrypts inputs and decrypts outputs. All intermediate computations on the server are performed on encrypted data.
+
+**Task**: **Edge-based (link) prediction** — each data row is one **edge** (e.g. one communication); the label is **per edge** (benign vs malicious). The pipeline trains and evaluates on edges, not on nodes.
+
+## Why the Edge Head? Why a Second Layer for Prediction?
+
+The GAT layer is **node-level**: it takes node features and the graph structure and outputs **one embedding vector per node**. There is no direct “edge logit” from GAT alone. For **edge (link) prediction** we need a **score per edge**, not per node.
+
+That is why we add an **edge head** (a second, small computation):
+
+1. **GAT output**: For each node we get an embedding `h_i` (e.g. 8-dimensional). So we have **node embeddings**, not edge scores.
+2. **Edge score**: For each edge `(src, dst)` we need one scalar (e.g. logit for “malicious?”). To get it we **combine** the two endpoints’ embeddings (and optionally the edge’s own features, e.g. bytes, duration).
+3. **Edge head**: A small **linear** (or MLP) layer that takes `[h_src; h_dst; edge_features]` and outputs one number:  
+   `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge`.
+
+So the “second layer” is not a second GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. In the **plaintext** pipeline this runs on the server (GAT + edge head in one forward). In the **FHE** pipeline the server only runs the GAT (encrypted); the client **decrypts node embeddings** and then runs the edge head **in plaintext** on the client (or the server could run an FHE edge head in a future extension). Either way, the edge head is what turns **node representations** into **edge predictions**.
 
 ## Key Achievements
 
-- ✅ **Fully Encrypted Pipeline**: NO intermediate decryption (only final output)
-- ✅ **Rotation-Based Operations**: Feature concatenation without decryption
-- ✅ **Homomorphic Division**: Newton-Raphson method for encrypted softmax
-- ✅ **Scheme Switching**: CKKS↔FHEW for encrypted sign computation
-- ✅ **Secure Storage**: FHEGraph stores only encrypted features
-- ✅ **Memory Optimization**: Configurable for 2GB-16GB RAM systems
-- ✅ **Verified Correctness**: Comparison testing with hardcoded graphs
+- ✅ **Fully Encrypted Pipeline**: No intermediate decryption (only final output on client)
+- ✅ **Client–Server Split**: Keys and decryption only on client; server runs CKKS only
+- ✅ **Rotation-Based Operations**: Feature concatenation and matmul without decryption
+- ✅ **Homomorphic Division**: Newton-Raphson in `fhe_utils_ckks.py` for encrypted softmax
+- ✅ **Secure Storage**: `FHEGraph` (server) stores only encrypted features
+- ✅ **Metrics**: CSV-based timing, RSS, and optional power/energy (see `client_server/README.md`)
+- ✅ **Plaintext Baseline**: `plain_client` / `plain_server` for comparison (edge-based, same data and batching)
+- ✅ **Edge-based pipeline**: One row = one edge; labels per edge; edge head for link prediction (see above)
 
-## Project Files
+## Project Files (current codebase)
 
 ```
 GAT-FHE/
-├── Core Implementation
-│   ├── gat_encoder.py           # PyTorch GAT + NumPy plaintext utilities
-│   ├── gat_encoder_fhe.py       # Fully-encrypted FHE encoder (652 lines)
-│   ├── fhe_graph.py             # Secure graph (encrypted-only storage)
-│   └── fhe_utils.py             # Homomorphic division (Newton-Raphson, Goldschmidt)
-│
-├── Supporting
-│   ├── cggi_helpers.py          # CKKS↔FHEW scheme switching setup
-│   └── test_graph.py            # Hardcoded test data for verification
-│
-├── Examples & Tests
-│   ├── example_verify.py        # Plaintext encoder verification
-│   └── example_fhe_verify.py    # FHE encoder verification & comparison
-│
-└── Documentation
-    ├── README.md                # Setup and quick start
-    ├── PLAN.md                  # Implementation design (257 lines)
-    ├── MEMORY_OPTIMIZATION.md   # Complete optimization guide
-    └── IMPLEMENTATION_SUMMARY.md # This document
+├── client_server/
+│   ├── client/
+│   │   ├── plain_client.py      # Plaintext client (train/infer, no FHE)
+│   │   ├── client.py            # FHE client (keygen, encrypt, decrypt)
+│   │   ├── client_keys.py       # Key generation and handling
+│   │   ├── utils.py             # Data loading, batching, preprocessing
+│   │   ├── metrics.py           # Client-side metrics (keygen, encrypt, decrypt)
+│   │   └── iot.csv              # Default IoT dataset (optional)
+│   ├── server/
+│   │   ├── plain_server.py      # Plaintext GAT server
+│   │   ├── server.py            # FHE server (CKKS only, no secret key)
+│   │   ├── ckks_runner.py       # FHE pipeline (forward, training, bootstrap)
+│   │   ├── encoder_ckks.py       # GATEncoderCKKS (linear, attention, softmax, aggregation)
+│   │   ├── fhe_graph.py         # Encrypted graph (CKKS ciphertexts only)
+│   │   ├── fhe_utils_ckks.py    # Newton-Raphson reciprocal, Chebyshev helpers
+│   │   ├── utils.py             # CSV writer, RSS, TCP helpers
+│   │   ├── metrics.py           # Server-side MetricsRecorder
+│   │   └── metrics_pi.py       # Raspberry Pi power/energy metrics
+│   ├── openfhe_serializer.py    # Serialization for ciphertexts/keys over TCP
+│   └── README.md                # Client–server usage, modes, metrics
+├── README.md                    # Repo overview and structure
+├── PIPELINE_ARCHITECTURE.md     # Pipeline and metrics (client_server)
+└── IMPLEMENTATION_SUMMARY.md    # This document
 ```
 
 ## Completed Stages
 
 ### Stage 1: CKKS Linear Layer ✅
 
-**File**: `gat_encoder_fhe.py` → `matmul_ckks()`
+**File**: `client_server/server/encoder_ckks.py` → `_matmul_ckks_dispatch` / matmul path
 
 **Implementation**:
 ```python
@@ -70,7 +90,7 @@ def matmul_ckks(self, ct_x: Ciphertext, W: np.ndarray) → List[Ciphertext]:
 
 ### Stage 2: Encrypted Attention Scores ✅
 
-**File**: `gat_encoder_fhe.py` → `attention_scores_ckks()`
+**File**: `client_server/server/encoder_ckks.py` → attention scores (rotation-based concat + inner product)
 
 **Implementation**:
 ```python
@@ -94,62 +114,19 @@ def attention_scores_ckks(self, ct_h_list, edge_index, num_nodes) → List[Ciphe
 
 **Result**: Fully encrypted, slight approximation error from rotations
 
-### Stage 3: Encrypted LeakyReLU ✅
+### Stage 3: LeakyReLU ✅
 
-**File**: `gat_encoder_fhe.py` → `leaky_relu_encrypted()`
+**File**: `client_server/server/encoder_ckks.py`
 
-**Implementation**:
-```python
-def leaky_relu_encrypted(self, ct_e, negative_slope=0.2) → Ciphertext:
-    """
-    Encrypted LeakyReLU via CKKS↔FHEW scheme switching
-    
-    Algorithm:
-    1. EvalCKKStoFHEWPrecompute(scale) - setup scaling
-    2. lwe_ct = EvalCKKStoFHEW(ct_e, 1) - switch to FHEW
-    3. lwe_sign = ccLWE.EvalSign(lwe_ct) - encrypted sign bit
-    4. ct_sign = EvalFHEWtoCKKS([lwe_sign], ...) - back to CKKS
-    5. result = ct_e * (neg_slope + ct_sign * (1 - neg_slope))
-    
-    Returns: y = x if x≥0 else negative_slope*x (encrypted)
-    """
-```
-
-**Features**:
-- Full scheme switching pipeline
-- Encrypted branching (no plaintext comparisons)
-- Configurable via `use_cggi` parameter
-
-**Result**: Functional (can disable for memory optimization)
+**Current implementation**: The client_server codebase is **CKKS-only**; there is no CKKS↔FHEW scheme switching. LeakyReLU may be implemented as an approximate polynomial or omitted in the encrypted path. See `encoder_ckks.py` for the exact activation used.
 
 ### Stage 4: Encrypted Softmax with Homomorphic Division ✅
 
-**File**: `gat_encoder_fhe.py` → `softmax_ckks_chebyshev()` + `fhe_utils.py`
+**Files**: `client_server/server/encoder_ckks.py` (softmax) + `client_server/server/fhe_utils_ckks.py` (Newton-Raphson)
 
 **Implementation**:
-```python
-def softmax_ckks_chebyshev(self, ct_e_list, edge_index, num_nodes) → List[Ciphertext]:
-    """
-    Fully encrypted softmax
-    
-    Algorithm:
-    1. Chebyshev exp(e) approximation (encrypted)
-    2. For each node group:
-       a. Sum exp values (encrypted)
-       b. Compute 1/sum via Newton-Raphson (encrypted)
-       c. Multiply: softmax = exp * (1/sum) (encrypted)
-    
-    Returns: Encrypted attention weights (NO DECRYPTION)
-    """
-
-# Newton-Raphson Division (fhe_utils.py)
-def encrypted_reciprocal_newton_raphson(cc, ct_denom, num_iterations=2-4):
-    """
-    x_{i+1} = x_i * (2 - d * x_i)
-    Converges to 1/d
-    Depth cost: 2 * num_iterations
-    """
-```
+- **Softmax**: Chebyshev exp approximation (encrypted), then per-node encrypted sum → Newton-Raphson reciprocal → encrypted softmax weights. See `encoder_ckks.py` (e.g. `encrypted_reciprocal_newton_raphson` usage).
+- **Newton-Raphson** (`fhe_utils_ckks.py`): `encrypted_reciprocal_newton_raphson(cc, ct_denom, ...)` — iterative encrypted 1/d; depth cost ~2 × num_iterations.
 
 **Features**:
 - Chebyshev polynomial for exp(x)
@@ -161,7 +138,7 @@ def encrypted_reciprocal_newton_raphson(cc, ct_denom, num_iterations=2-4):
 
 ### Stage 5: Secure Graph Storage ✅
 
-**File**: `fhe_graph.py`
+**File**: `client_server/server/fhe_graph.py`
 
 **Security Design**:
 ```python
@@ -181,10 +158,12 @@ class FHEGraph:
 
 **Security**: Plaintext features exist only during encryption, never retained.
 
-## Architecture: Fully-Encrypted Pipeline
+## Architecture: Fully-Encrypted Pipeline (Edge-Based)
+
+Data: one row = one edge; node features (e.g. 2-dim structural: in/out degree); edge features (e.g. 3-dim: src_bytes, dst_bytes, duration). GAT runs on encrypted node features and outputs **encrypted node embeddings**. The edge head (plaintext on client after decryption, or future FHE) turns those into one score per edge.
 
 ```
-Input: Plaintext x (N, F_in) + edge_index (2, E)
+Input: Plaintext x (N, F_in) + edge_index (2, E)  [F_in=2 for edge-based node features]
                     ↓
 ┌────────────────────────────────────────────────────────┐
 │ 0. Encrypt & Store (FHEGraph.from_plain_encrypted)    │
@@ -231,7 +210,8 @@ Input: Plaintext x (N, F_in) + edge_index (2, E)
 │    ⚠️  ONLY decryption in entire pipeline              │
 └────────────────────────────────────────────────────────┘
 
-Output: Node embeddings with CKKS approximation error
+Output: Node embeddings (N, F_out) with CKKS approximation error
+       → Client decrypts; edge head: logit_e = f(h_src, h_dst, edge_feats) per edge
 ```
 
 ## Configuration Profiles
@@ -329,7 +309,7 @@ GATEncoderFHE(
 
 ## Core Components
 
-### 1. Secure FHE Graph (`fhe_graph.py`)
+### 1. Secure FHE Graph (`client_server/server/fhe_graph.py`)
 
 **Security Principle**: Plaintext NEVER stored, only encrypted ciphertexts.
 
@@ -346,11 +326,11 @@ class FHEGraph:
 - `from_plain_encrypted(x_plain, cc, pk, ...)`: Encrypts immediately, discards plaintext
 - `from_encrypted(ct_list, ...)`: Build from pre-encrypted features
 
-### 2. FHE GAT Encoder (`gat_encoder_fhe.py`)
+### 2. FHE GAT Encoder (`client_server/server/encoder_ckks.py`)
 
-**Main Method**: `forward_fhe_full(graph) → np.ndarray`
+**Main entry**: `GATEncoderCKKS`; pipeline is driven by `client_server/server/ckks_runner.py` (`run_gat_forward_only`, `run_gat_pipeline_fhe_training`). Server never sees plaintext; client decrypts final output.
 
-**Pipeline** (652 lines total):
+**Pipeline** (conceptual):
 
 ```python
 # Stage 1: Linear Layer
@@ -385,84 +365,42 @@ aggregate_fhe(ct_h_list, edges, ct_alpha, N) → List[ct_out]
 
 **Total Depth**: 10-30 (configuration dependent)
 
-### 3. Homomorphic Division (`fhe_utils.py`)
+### 3. Homomorphic Division (`client_server/server/fhe_utils_ckks.py`)
 
-**Newton-Raphson Method** (Primary):
+**Newton-Raphson** (used for softmax normalization):
 ```python
-encrypted_reciprocal_newton_raphson(cc, ct_d, num_iterations, initial_guess):
+encrypted_reciprocal_newton_raphson(cc, ct_d, num_iterations, ...):
     """
     Iterative approximation: x_{i+1} = x_i * (2 - d*x_i) → 1/d
-    
-    Convergence: Quadratic (doubles precision per iteration)
     Depth: 2 * num_iterations
-    Accuracy: ~0.01 with 2 iters, ~0.001 with 4 iters
     """
 ```
 
-**Goldschmidt Algorithm** (Alternative):
-```python
-encrypted_reciprocal_goldschmidt(cc, ct_d, num_iterations, scale_factor):
-    """
-    Multiplicative convergence method
-    Better for SIMD parallel divisions
-    """
-```
+**Usage**: Called from `encoder_ckks.py` for encrypted softmax (exp * 1/sum).
 
-**Usage**:
-```python
-# Softmax normalization (per node)
-ct_sum = sum(ct_exp_values)              # Encrypted sum
-ct_recip = newton_raphson(cc, ct_sum, 2) # Encrypted 1/sum
-ct_norm = ct_exp * ct_recip              # Encrypted softmax
-```
+### 4. Scheme switching (not in current client_server)
 
-### 4. Scheme Switching (`cggi_helpers.py`)
-
-**Setup Function**:
-```python
-setup_scheme_switching(cc_ckks, keys, slots):
-    """
-    Configure CKKS↔FHEW conversion
-    
-    Returns:
-    - privateKeyFHEW: FHEW secret key
-    - ccLWE: BinFHEContext for boolean operations
-    
-    Enables:
-    - EvalCKKStoFHEW: Convert CKKS → FHEW
-    - EvalSign: Compute encrypted sign bit
-    - EvalFHEWtoCKKS: Convert FHEW → CKKS
-    """
-```
-
-**Used For**: Encrypted LeakyReLU activation function
+The current **client_server** implementation is **CKKS-only**. There is no CKKS↔FHEW scheme switching or `cggi_helpers` in this codebase. LeakyReLU in the FHE path is handled within CKKS (e.g. polynomial approximation) or as configured in `encoder_ckks.py`.
 
 ## Testing & Verification
 
-### Hardcoded Comparison Testing
+### Plaintext vs FHE (client_server)
 
-Both encoders run on **identical inputs** (`test_graph.py`):
+- **Plaintext baseline**: Run `plain_server` then `plain_client` (same data, no encryption). Use for correctness and performance comparison.
+- **FHE**: Run `server` then `client`; client encrypts inputs and decrypts outputs; server runs CKKS pipeline only.
 
-```python
-# Hardcoded test data
-NUM_NODES = 6
-NUM_EDGES = 10
-FEATURES = 4 → 4
-
-# Same random seed (42) for weight initialization
-# Ensures we test FHE operations, not weight differences
-```
-
-**Run Comparison**:
+**Run comparison**:
 ```bash
-# 1. Plaintext encoder (NumPy)
-python example_verify.py
-# Output: Per-node embeddings
+# Plaintext (two terminals)
+python -m client_server.server.plain_server
+python -m client_server.client.plain_client
 
-# 2. FHE encoder (should match within CKKS precision)
-python example_fhe_verify.py  
-# Output: Per-node embeddings + difference statistics
+# FHE (two terminals)
+python -m client_server.server.server
+python -m client_server.client.client
 ```
+
+Data (e.g. `client_server/client/iot.csv` or a `.npz` graph) is loaded by the client. See `client_server/README.md` for in-process vs network modes and metrics output.
 
 ### Verification Checks
 
@@ -482,7 +420,7 @@ python example_fhe_verify.py
 | Linear transform | Rotation-based matmul | ✅ No decryption |
 | Concatenation | Rotation packing | ✅ No decryption |
 | Inner product | EvalMult + rotation sum | ✅ No decryption |
-| Sign bit | CKKS↔FHEW + EvalSign | ✅ No decryption |
+| Sign bit (if used) | CKKS polynomial / approx | ✅ No decryption (current: CKKS-only) |
 | Exponential | Chebyshev polynomial | ✅ No decryption |
 | Division | Newton-Raphson | ✅ No decryption (full mode) |
 | Weighted sum | EvalMult + EvalAdd | ✅ No decryption |
@@ -500,7 +438,6 @@ python example_fhe_verify.py
 **Attack Resistance**:
 - ✅ **No feature leakage**: Encrypted features never exposed
 - ✅ **No timing attacks**: Execution time independent of values
-- ✅ **IND-CPA secure**: CKKS provides semantic security
 - ⚠️ **Graph structure visible**: Topology not encrypted (accepted limitation)
 
 ## Memory Optimization Strategies
@@ -518,14 +455,7 @@ mult_depth = 12  # vs 30
 # Trade-off: Fewer operations or lower precision
 ```
 
-### 3. Disable Scheme Switching
-```python
-use_cggi = False
-# Saves: FHEW context overhead, switching key storage
-# Trade-off: LeakyReLU becomes identity
-```
-
-### 4. Use Plaintext for Non-Critical Ops
+### 3. Use Plaintext for Non-Critical Ops
 ```python
 # Softmax normalization (memory mode)
 # - Exp computation: encrypted ✓
@@ -533,46 +463,8 @@ use_cggi = False
 # Saves: Newton-Raphson iterations (4-8 mults)
 ```
 
-See `MEMORY_OPTIMIZATION.md` for complete guide.
+See `client_server/README.md` and `PIPELINE_ARCHITECTURE.md` for metrics and pipeline options.
 
-## Limitations
-
-### Current Constraints
-
-1. **Single Layer**: Only one GAT layer
-   - Multi-layer requires depth budget management
-   - Can extend with careful planning
-
-2. **Graph Topology**: Edges stored in plaintext
-   - Standard limitation in encrypted GNN
-   - Encrypting topology is open research problem
-
-3. **Model Weights**: W and a in plaintext
-   - Can be encrypted if needed (adds depth)
-   - Often acceptable (weights are public)
-
-4. **Approximation Error**: CKKS is approximate
-   - Chebyshev polynomials introduce error
-   - Newton-Raphson has convergence tolerance
-   - Typical: 0.1-0.5 max difference
-
-### Hardware Requirements
-
-| Profile | Min RAM | Recommended | CPU |
-|---------|---------|-------------|-----|
-| Memory-Opt | 2GB | 4GB | 2+ cores |
-| Balanced | 4GB | 8GB | 4+ cores |
-| Maximum | 8GB | 16GB | 8+ cores |
-
-## Future Work
-
-- [ ] Multi-layer GAT with residual connections
-- [ ] Multi-head attention (SIMD optimization)
-- [ ] Encrypted graph topology (research-level)
-- [ ] Bootstrapping for arbitrary depth
-- [ ] GPU acceleration (OpenFHE CUDA)
-- [ ] Automatic parameter tuning
-- [ ] Production deployment guide
 
 ## References
 
@@ -584,24 +476,10 @@ See `MEMORY_OPTIMIZATION.md` for complete guide.
 2. **Function Evaluation**: [function-evaluation.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/function-evaluation.py)
    - Chebyshev polynomial approximations
 
-3. **Scheme Switching**: [scheme-switching.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/pke/scheme-switching.py)
-   - CKKS↔FHEW conversion, EvalSign for comparisons
-
-4. **BinFHE**: [boolean.py](https://github.com/openfheorg/openfhe-python/blob/main/examples/binfhe/boolean.py)
-   - Boolean gate operations
-
 ### Academic References
 
 - **CKKS**: Cheon et al., "Homomorphic Encryption for Arithmetic of Approximate Numbers" ([ePrint 2016/421](https://eprint.iacr.org/2016/421))
 - **Newton-Raphson in HE**: "Homomorphic Polynomial Evaluation" ([ePrint 2020/1483](https://eprint.iacr.org/2020/1483))
-- **Scheme Switching**: "Efficient Homomorphic Conversion Between Schemes" ([ePrint 2021/091](https://eprint.iacr.org/2021/091))
 - **GAT**: Veličković et al., "Graph Attention Networks", ICLR 2018 ([arXiv:1710.10903](https://arxiv.org/abs/1710.10903))
 
----
-
-**Implementation Date**: February 2026  
-**OpenFHE Version**: 1.4.2.0 (Ubuntu 24.04)  
-**Python Version**: 3.12  
-**Status**: ✅ **PRODUCTION-READY** (memory-optimized mode)
-
-For questions or issues, see `README.md` or `MEMORY_OPTIMIZATION.md`.
+For questions or issues, see `README.md` or `client_server/README.md`.

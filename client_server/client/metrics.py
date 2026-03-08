@@ -95,16 +95,18 @@ class MetricsRecorder:
             )
         return rec
 
-    def write_txt(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(
-                "name,seconds,rss_delta_bytes,rss_after_bytes,encrypted,energy_joules,power_watts\n"
-            )
+    def write_csv(self, path: str) -> None:
+        """Write client-side metrics to CSV: step, server_time=0, client_time (per phase: keygen, encrypt, decrypt), rss_*, power, energy, throughput."""
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "server_time", "client_time", "rss_after_bytes", "rss_delta_bytes", "power_watts", "energy_joules", "throughput"])
             for m in self._metrics:
-                f.write(
-                    f"{m.name},{m.seconds:.6f},{m.rss_delta_bytes},{m.rss_after_bytes},"
-                    f"{int(m.encrypted)},{m.energy_joules:.6f},{m.power_watts:.6f}\n"
-                )
+                throughput = (1.0 / m.seconds) if m.seconds > 0 else 0.0
+                writer.writerow([
+                    m.name, "0.0", f"{m.seconds:.6f}", m.rss_delta_bytes, m.rss_after_bytes,
+                    f"{m.power_watts:.6f}", f"{m.energy_joules:.6f}", f"{throughput:.6f}",
+                ])
 
     def print_report(self) -> None:
         if not self._metrics:

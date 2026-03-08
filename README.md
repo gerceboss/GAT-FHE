@@ -1,45 +1,45 @@
-# GAT Encoder
+# GAT-FHE: Edge-Based (Link) Prediction with FHE GAT
 
-Graph Attention Network (GAT) **encoder only** — no classification head. Plaintext PyTorch implementation plus **fully-encrypted** single-layer encoder using [OpenFHE Python](https://github.com/openfheorg/openfhe-python):
+Graph Attention Network (GAT) **encoder** plus **edge head** for **edge (link) prediction**: one row = one edge (e.g. one communication), label per edge (benign vs malicious). Plaintext and **fully-encrypted** single-layer GAT using [OpenFHE Python](https://github.com/openfheorg/openfhe-python):
 
 - **CKKS** for all real-valued arithmetic (linear transforms via homomorphic matrix–vector products, attention scores, softmax, aggregation)
   - **Rotation-based packing**: Concatenates encrypted features without decryption
   - **Homomorphic inner products**: Computes attention scores entirely encrypted
-- **FHEW/CGGI** (BinFHE/GINX) for boolean operations (sign, comparisons, if-else)
-- **Scheme Switching** (CKKS ↔ FHEW) for encrypted branching:
-  - **Encrypted LeakyReLU**: Uses `EvalCKKStoFHEW` → `EvalSign` → `EvalFHEWtoCKKS` pipeline
-  - Sign computation fully encrypted (no intermediate decryption)
 
-### 🔒 **Configurable Encryption Pipeline** with Per-Step Control (Default: All Encrypted)
+### Why an Edge Head? (Second Step for Prediction)
+
+The GAT layer is **node-level**: it outputs **one embedding per node**, not per edge. For **edge (link) prediction** we need **one score per edge**. So we add an **edge head**: a small linear layer that takes, for each edge, the two endpoint embeddings and optional edge features and outputs one logit: `logit = W_edge @ [h_src; h_dst; edge_feats] + b`. That second computation turns **node representations** into **edge predictions**. In FHE, the server runs only the GAT (encrypted); the client decrypts node embeddings and runs the edge head in plaintext. See `IMPLEMENTATION_SUMMARY.md` and `client_server/README.md` for details.
+
+### **Configurable Encryption Pipeline** with Per-Step Control (Default: All Encrypted)
 
 Each step can be configured as **encrypted** (`enc`) or **plaintext** (`dec`).  
 **Default is `enc` for all steps** (maximum privacy):
 
 1. **Linear Layer** (h' = Wx)
-   - 🔒 Encrypted: CKKS matrix multiplication with rotation-based summation
-   - 🔓 Plaintext: NumPy matrix multiplication (faster)
+   - Encrypted: CKKS matrix multiplication with rotation-based summation
+   - Plaintext: NumPy matrix multiplication (faster)
 
 2. **Attention Scores** (e_ij = a^T [h'_i || h'_j])
-   - 🔒 Encrypted: Rotation-based concatenation + homomorphic inner product
-   - 🔓 Plaintext: NumPy concatenation and dot product
+   - Encrypted: Rotation-based concatenation + homomorphic inner product
+   - Plaintext: NumPy concatenation and dot product
 
 3. **LeakyReLU** (activation)
-   - 🔒 Encrypted: CKKS↔FHEW scheme switching with encrypted sign bit
-   - 🔓 Plaintext: NumPy conditional operation
+   - Encrypted: CKKS↔FHEW scheme switching with encrypted sign bit
+   - Plaintext: NumPy conditional operation
 
 4. **Softmax** (normalization)
-   - 🔒 Encrypted: Chebyshev polynomial approximation + Newton-Raphson division
-   - 🔓 Plaintext: NumPy exp and normalization
+   - Encrypted: Chebyshev polynomial approximation + Newton-Raphson division
+   - Plaintext: NumPy exp and normalization
 
 5. **Aggregation** (h_j = Σ α_ij * h'_i)
-   - 🔒 Encrypted: Weighted sum in CKKS
-   - 🔓 Plaintext: NumPy weighted aggregation
+   - Encrypted: Weighted sum in CKKS
+   - Plaintext: NumPy weighted aggregation
 
 **Automatic Metrics Tracking:**
-- ⏱️ Per-step timing (seconds)
-- 💾 Per-step memory delta (RSS in MB)
-- 🔒/🔓 Encryption status for each operation
-- 📊 Summary statistics and performance breakdown
+- Per-step timing (seconds)
+- Per-step memory delta (RSS in MB)
+- Encryption status for each operation (enc/dec)
+- Summary statistics and performance breakdown
 
 ### Scheme switching metrics (Step 3)
 
@@ -73,27 +73,57 @@ See `PLAN.md` for staged implementation design; references: [CKKS advanced-real-
 
 ## Repository Structure
 
+The codebase is organised around the **client–server** GAT pipeline (plaintext and CKKS FHE). All runnable code lives under `client_server/`.
+
 ```
 GAT-FHE/
-├── gat_encoder/              # Plaintext GAT implementation
-│   ├── __init__.py
-│   └── core.py               # PyTorch and NumPy GAT encoder
-├── gat_encoder_fhe/          # FHE GAT implementation  
-│   ├── __init__.py
-│   ├── encoder.py            # Main FHE encoder (CKKS + FHEW)
-│   ├── fhe_graph.py          # Encrypted graph data structure
-│   ├── fhe_utils.py          # Homomorphic division utilities
-│   └── cggi_helpers.py       # Scheme switching setup
-├── examples/                 # Usage examples
-│   ├── plain_gat.py          # Plaintext GAT verification
-│   ├── fhe_gat.py            # FHE GAT verification (hardcoded test graph)
-│   ├── test_graph.py         # Hardcoded test graph
-│   ├── generate_graph.py     # CLI tool to generate random graphs
-│   └── run_fhe_on_graph.py   # Run FHE encoder on graph files
-└── tests/                    # Unit tests
-    ├── test_gat_encoder.py      # Plaintext encoder tests
-    └── test_gat_encoder_fhe.py  # FHE encoder tests (skip if no OpenFHE)
+├── client_server/             # Client–server GAT (plain + CKKS FHE)
+│   ├── client/                # Clients and shared client utilities
+│   │   ├── __init__.py
+│   │   ├── plain_client.py   # Plaintext client (data load, train, infer, metrics)
+│   │   ├── client.py         # FHE client (keygen, encrypt, decrypt, train/infer)
+│   │   ├── client_keys.py    # CKKS context and key generation (OpenFHE)
+│   │   ├── utils.py          # Shared: data load, batching, metrics (load_iot_edge_train_test, build_edge_batch, compute_classification_metrics)
+│   │   ├── metrics.py        # Client-side metrics (client_time, server_time, CSV)
+│   │   └── iot.csv           # IoT dataset (optional; can override via --data)
+│   ├── server/               # Servers and FHE compute
+│   │   ├── __init__.py
+│   │   ├── plain_server.py   # Plaintext GAT server (train/infer over TCP)
+│   │   ├── server.py         # FHE server (train/infer on ciphertexts, no secret key)
+│   │   ├── ckks_runner.py    # CKKS training/inference pipeline (streaming softmax, bootstrap)
+│   │   ├── encoder_ckks.py   # GATEncoderCKKS (linear, attention, LeakyReLU, softmax, aggregation)
+│   │   ├── fhe_graph.py      # FHEGraph (encrypted node features + edge_index)
+│   │   ├── fhe_utils_ckks.py # Homomorphic utilities (LeakyReLU coeffs, Newton–Raphson reciprocal)
+│   │   ├── metrics.py        # Server metrics (MetricsRecorder, step, to_dict)
+│   │   ├── metrics_pi.py      # Raspberry Pi metrics (RSS, power, optional)
+│   │   └── utils.py          # Shared: rss_bytes, write_metrics_csv, TCP framing (recv_frame, send_ok, etc.)
+│   ├── openfhe_serializer.py # Payload serialisation for FHE (train/infer/gradient-step, JSON/BINARY)
+│   └── README.md             # Full usage, metrics, and deployment
+├── README.md                 # This file; setup and repo overview
+├── PIPELINE_ARCHITECTURE.md  # Pipeline design and client_server alignment
+├── IMPLEMENTATION_SUMMARY.md # Implementation summary and references
+└── requirements.txt
 ```
+
+### CKKS parameters used by the client–server pipeline (`client_server/`)
+
+The following values are taken from the code (defaults in `client_keys.py` and `client.py`). Override via CLI where documented.
+
+| Parameter | Default in code | Meaning |
+| --------- | ----------------- | ------- |
+| **Ring dimension** | `16384` | Polynomial ring degree \(N\). Larger \(N\) = more slots and security, higher RAM. Max slots = \(N/2\). Set via `--ring_dim` (client). For 128-bit security standard use `131072` (requires OpenFHE build with `HEStd_NotSet` for smaller \(N\)). |
+| **Slots** | `8` | Number of packed plaintext values per CKKS ciphertext. Fixed to 8 in the IoT GAT client (`F_in=2`, `F_out=8`); each node’s features fit in one ciphertext with zero-padding. |
+| **Multiplicative depth** | `25` | Levels reserved for one epoch of FHE ops before bootstrapping. Set via `--mult_depth`. With bootstrapping enabled, total depth = `mult_depth` + bootstrap overhead (~10), so chain is ~35 levels. |
+| **Scaling (ciphertext) modulus** | `scale_mod_size = 50` | CKKS scaling factor in **bits** (~15 decimal digits of precision). Set in `client_keys.py`; not currently exposed on CLI. |
+| **First modulus size** | `60` (bits) | Size of the first modulus in the chain. Set in `client_keys.py`. |
+| **Plaintext / scaling** | CKKS has no separate “plaintext modulus”; the effective scale is determined by `scale_mod_size` and the modulus chain. Scaling technique is **FLEXIBLEAUTO**. |
+
+**When bootstrapping happens**
+
+- **Training:** After **each epoch**, weight ciphertexts `ct_W_list` are bootstrapped when `bootstrap_weights=True` (default), so the next epoch has enough multiplicative levels. Level budget for bootstrap precomputation is **`[4, 4]`** (encoding/decoding levels), and `EvalBootstrapSetup(levelBudget=[4,4], slots=slots)` is called on both client and server with the **same** `slots` (server replays it from the payload).
+- **Inference:** After the GAT forward pass, **output** ciphertexts are bootstrapped when their level (`GetLevel()`) is **≥ `bootstrap_level_threshold`** (default **4**) in `server.py`’s `_bootstrap_output_cts`. That refreshes them before decryption would fail with “approximation error is too high”.
+
+So: bootstrapping is used (1) on **weights** after every training epoch, and (2) on **output ciphertexts** after inference when their level ≤ 4. Disable with `--no_bootstrap` for shallow tests (no bootstrap keys).
 
 ## Setup
 
@@ -284,11 +314,11 @@ graph = FHEGraph.from_plain_encrypted(
 
 # Configure pipeline: encrypt critical steps only
 cfg = GATRunConfig(
-    step1_linear="enc",       # 🔒 Encrypted (protect model weights)
-    step2_attention="dec",     # 🔓 Plaintext (faster)
-    step3_leakyrelu="dec",     # 🔓 Plaintext
-    step4_softmax="enc",       # 🔒 Encrypted (protect attention)
-    step5_aggregation="dec",   # 🔓 Plaintext
+    step1_linear="enc",       # Encrypted (protect model weights)
+    step2_attention="dec",     # Plaintext (faster)
+    step3_leakyrelu="dec",     # Plaintext
+    step4_softmax="enc",       # Encrypted (protect attention)
+    step5_aggregation="dec",   # Plaintext
     print_metrics=True,        # Show timing & memory stats
 )
 
@@ -299,11 +329,11 @@ output = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
 **Output includes detailed metrics:**
 ```
 === Metrics (time + RSS delta) ===
-  1_linear_layer            🔒 ENC   12.3450s  RSS Δ  +123.45 MB  RSS   456.78 MB
-  2_attention_scores        🔓 DEC    0.0023s  RSS Δ   +0.12 MB  RSS   456.90 MB
-  3_leakyrelu_scheme_switch 🔓 DEC    0.0001s  RSS Δ   +0.00 MB  RSS   456.90 MB
-  4_softmax                 🔒 ENC    8.7654s  RSS Δ  +89.01 MB  RSS   545.91 MB
-  5_aggregation             🔓 DEC    0.0045s  RSS Δ   +0.23 MB  RSS   546.14 MB
+  1_linear_layer            ENC   12.3450s  RSS Δ  +123.45 MB  RSS   456.78 MB
+  2_attention_scores        DEC    0.0023s  RSS Δ   +0.12 MB  RSS   456.90 MB
+  3_leakyrelu_scheme_switch DEC    0.0001s  RSS Δ   +0.00 MB  RSS   456.90 MB
+  4_softmax                 ENC   8.7654s  RSS Δ  +89.01 MB  RSS   545.91 MB
+  5_aggregation             DEC    0.0045s  RSS Δ   +0.23 MB  RSS   546.14 MB
 ```
 
 ## Complete Workflow Examples

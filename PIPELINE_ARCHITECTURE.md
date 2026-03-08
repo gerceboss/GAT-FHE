@@ -1,61 +1,58 @@
-# FHE GAT Encoder - Pipeline Architecture
+# FHE GAT Encoder — Pipeline Architecture
 
 ## Overview
 
-The FHE GAT Encoder now features a modular pipeline architecture inspired by the `edge_hybrid_fhe` project, with:
+This document describes the **pipeline architecture** for the FHE GAT encoder. The **current codebase** implements this in the **client–server** layout under `client_server/`: CKKS-only pipeline, server never holds the secret key, with shared utilities and consistent metrics.
 
-1. **Per-Step Encryption Control**: Configure each operation as encrypted (`enc`) or plaintext (`dec`)
-2. **Automatic Metrics Tracking**: Real-time memory (RSS) and timing measurements
-3. **Flexible Pipeline Runner**: Easy-to-use API for running the full pipeline
-4. **BGV Scheme Support**: In addition to CKKS, now supports BGV for integer operations
+**Task**: **Edge-based (link) prediction**. Each sample is one **edge** (e.g. one communication record); the label is **per edge** (benign vs malicious). Batches are built over edges (e.g. 60 edges per batch); each batch induces a subgraph of nodes and edges.
 
-## Architecture Components
+**Current implementation (client_server):**
 
-### 1. Metrics System (`gat_encoder_fhe/metrics.py`)
+1. **Client** (`client_server/client/`): Plain and FHE clients; shared data loading (`load_iot_edge_train_test`, `build_edge_batch`), batching, and metrics in `utils.py`; client-side metrics (keygen, encrypt, decrypt) in `metrics.py`.
+2. **Server** (`client_server/server/`): Plain and FHE servers; shared RSS/CSV/TCP helpers in `utils.py`; FHE pipeline in `ckks_runner.py` and `encoder_ckks.py`; metrics in `metrics.py` / `metrics_pi.py`.
+3. **Metrics**: All outputs are CSV-only, with standard columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`. See `client_server/README.md` for where each file is written and what each field means.
 
-Tracks memory and timing for each pipeline step using context managers:
+The pipeline steps below (linear, attention, LeakyReLU, softmax, aggregation) are implemented in **`client_server/server/encoder_ckks.py`** (GATEncoderCKKS) and orchestrated by **`client_server/server/ckks_runner.py`** (streaming forward/backward, bootstrap). There is no per-step enc/dec configuration in the current client_server code: the FHE path is fully encrypted.
+
+---
+
+## Why the Edge Head? (Second Step for Prediction)
+
+The GAT encoder is **node-level**: it consumes node features and the graph and produces **one embedding per node**. It does **not** output a score per edge. For **edge (link) prediction** we need one scalar per edge (e.g. “is this communication malicious?”).
+
+Therefore we add an **edge head** — a second, lightweight computation that turns **pairs of node embeddings** (and optional edge features) into **one score per edge**:
+
+- **Input to edge head**: For each edge `(src, dst)`, we have `h_src`, `h_dst` (GAT embeddings) and optionally `edge_feats` (e.g. src_bytes, dst_bytes, duration).
+- **Computation**: `logit_edge = W_edge @ [h_src; h_dst; edge_feats] + b_edge` (one linear layer).
+- **Output**: One logit per edge, then e.g. sigmoid for probability.
+
+So the “second layer” is not another GAT layer; it is an **edge-level classifier** on top of the GAT node embeddings. In the **plaintext** server, GAT and edge head run together (e.g. `PlainGATModelEdge`). In the **FHE** path, the server runs only the GAT on encrypted data; the client **decrypts node embeddings** and runs the edge head **in plaintext** (or a future FHE edge head could run on the server). Either way, the edge head is what converts **node representations** into **edge predictions**.
+
+---
+
+## Architecture Components (conceptual and where they live in code)
+
+### 1. Metrics system
+
+**In client_server:**  
+- **Client:** `client_server/client/metrics.py` — `MetricsRecorder`, `step(name, encrypted=...)`, `to_dict()`, `write_csv()`; records `client_time` per phase (keygen, encrypt, decrypt).  
+- **Server:** `client_server/server/metrics.py` (or `metrics_pi.py` on Pi) — `MetricsRecorder`, `step(name, encrypted=...)`; used by `ckks_runner.py` and `server.py`; outputs `server_time`, RSS, power, energy.  
+- **Shared CSV writer:** `client_server/server/utils.py` — `write_metrics_csv(path, data, time_side="server"|"client"|"both")` with standard columns.
 
 ```python
-from gat_encoder_fhe import MetricsRecorder
-
-metrics = MetricsRecorder()
-
-with metrics.step("linear_layer", encrypted=True):
-    # ... perform operation ...
-    pass
-
-metrics.print_report()  # Shows detailed breakdown
+# Example (server side, in ckks_runner.py)
+with metrics.step("1_linear", encrypted=True):
+    ct_h_list = [encoder._matmul_ckks_dispatch(ct_x) for ct_x in ct_x_list]
 ```
 
-**Features:**
-- Uses `/proc/self/status` for accurate RSS tracking on Linux
-- Fallback to `resource.getrusage()` on other platforms
-- Tracks: operation name, duration, RSS delta, final RSS, encryption status
+### 2. Pipeline runner (FHE)
 
-### 2. Pipeline Runner (`gat_encoder_fhe/runner.py`)
+**In client_server:** The FHE pipeline is run by **`client_server/server/ckks_runner.py`**:
 
-Executes the full GAT pipeline with configurable per-step encryption:
+- `run_gat_forward_only(encoder, graph, ...)` — inference only.
+- `run_gat_pipeline_fhe_training(encoder, graph, ct_labels, train_mask, num_epochs, lr, bootstrap_weights=True)` — training with streaming softmax, encrypted gradient, weight update, and optional weight bootstrapping after each epoch.
 
-```python
-from gat_encoder_fhe import GATRunConfig, run_gat_pipeline
-
-cfg = GATRunConfig(
-    step1_linear="enc",       # Encrypted
-    step2_attention="dec",     # Plaintext (faster)
-    step3_leakyrelu="dec",     # Plaintext
-    step4_softmax="enc",       # Encrypted
-    step5_aggregation="dec",   # Plaintext
-    print_metrics=True,
-)
-
-output = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
-```
-
-**Configuration Options:**
-- `Mode = Literal["enc", "dec"]` for each step
-- FHE parameters (batch_size, mult_depth, scale_mod_size)
-- Scheme selection: "CKKS" (default) or "BGV"
-- Reporting options (print_metrics, print_shapes)
+There is no separate `GATRunConfig` in this codebase; the server always runs the fully encrypted CKKS pipeline. Plaintext vs FHE is chosen by running the plain client/server or the FHE client/server.
 
 ### 3. Pipeline Steps
 
@@ -86,82 +83,47 @@ The GAT encoder pipeline consists of 5 main steps:
 - **Plaintext**: NumPy weighted aggregation
 - **Purpose**: Aggregate neighbor features using attention weights
 
-## Usage Examples
+**Edge head (after GAT)**  
+- **Plaintext**: Linear layer on `[h_src; h_dst; edge_feats]` → one logit per edge (plain server and FHE client).  
+- **Purpose**: Turn node embeddings into edge-level predictions for link/edge classification.
 
-### Example 1: Fully Encrypted (Maximum Security)
+## Usage (client_server)
 
-```python
-cfg = GATRunConfig(
-    step1_linear="enc",
-    step2_attention="enc",
-    step3_leakyrelu="enc",
-    step4_softmax="enc",
-    step5_aggregation="enc",
-    print_metrics=True,
-)
+The pipeline is run by starting the **server** then the **client** (plain or FHE).
 
-output = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
+### Plaintext baseline (no FHE)
+
+```bash
+# Terminal 1
+python -m client_server.server.plain_server
+
+# Terminal 2
+python -m client_server.client.plain_client
 ```
 
-**Use Case**: Maximum privacy, all operations encrypted
-**Trade-off**: Higher latency (~20-30s for small graphs)
+### FHE pipeline (CKKS, fully encrypted)
 
-### Example 2: Hybrid (Critical Steps Only)
+```bash
+# Terminal 1
+python -m client_server.server.server
 
-```python
-cfg = GATRunConfig(
-    step1_linear="enc",       # Protect model weights
-    step2_attention="dec",    
-    step3_leakyrelu="dec",    
-    step4_softmax="enc",      # Protect attention patterns
-    step5_aggregation="dec",  
-    print_metrics=True,
-)
-
-output = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
+# Terminal 2
+python -m client_server.client.client
 ```
 
-**Use Case**: Balance between security and performance
-**Trade-off**: ~2-5x faster than fully encrypted
-**Security**: Critical operations (linear, softmax) remain encrypted
+The FHE server loads the graph and runs `run_gat_forward_only` or `run_gat_pipeline_fhe_training` from `ckks_runner.py`; the client handles keygen, encryption of inputs, and decryption of outputs. There is no per-step enc/dec toggle: the FHE path is fully encrypted.
 
-### Example 3: All Plaintext (Baseline)
+## Metrics output (client_server)
 
-```python
-cfg = GATRunConfig(
-    step1_linear="dec",
-    step2_attention="dec",
-    step3_leakyrelu="dec",
-    step4_softmax="dec",
-    step5_aggregation="dec",
-    print_metrics=True,
-)
+Metrics are written to **CSV** by the server (and optionally the client). Standard columns: `step`, `server_time`, `client_time`, `rss_after_bytes`, `rss_delta_bytes`, `power_watts`, `energy_joules`, `throughput`. See `client_server/README.md` for file locations and column definitions.
 
-output = run_gat_pipeline(encoder=encoder, graph=graph, cfg=cfg)
-```
+Example of the kind of data recorded (conceptual):
 
-**Use Case**: Performance baseline for comparison
-**Trade-off**: ~10-100x faster than fully encrypted
-**Security**: No encryption (for testing only)
-
-## Metrics Output Example
-
-```
-================================================================================
-=== Metrics (time + RSS delta) ===
-================================================================================
-  1_linear_layer            🔒 ENC   12.3450s  RSS Δ  +123.45 MB  RSS   456.78 MB
-  2_attention_scores        🔓 DEC    0.0023s  RSS Δ   +0.12 MB  RSS   456.90 MB
-  3_leakyrelu_scheme_switch 🔓 DEC    0.0001s  RSS Δ   +0.00 MB  RSS   456.90 MB
-  4_softmax                 🔒 ENC    8.7654s  RSS Δ  +89.01 MB  RSS   545.91 MB
-  5_aggregation             🔓 DEC    0.0045s  RSS Δ   +0.23 MB  RSS   546.14 MB
---------------------------------------------------------------------------------
-  TOTAL                              21.1173s  RSS Δ  +212.81 MB
-
-  Encrypted ops:   21.1104s ( 99.9%)
-  Plaintext ops:    0.0069s (  0.1%)
-================================================================================
-```
+| step        | server_time | client_time | rss_after_bytes | rss_delta_bytes |
+|------------|-------------|-------------|-----------------|-----------------|
+| 1_linear   | 12.34       |             | 456789012       | 123456789       |
+| 2_attention| 0.05        |             | 457000000       | 210988          |
+| ...        | ...         | ...         | ...             | ...             |
 
 ## Performance Comparison
 
@@ -179,83 +141,51 @@ Based on typical 6-node, 10-edge graph (4→4 features):
 - Encrypting only critical steps (linear + softmax) maintains ~93% security with 1.8x speedup
 - Plaintext operations are 100-1000x faster but offer no security
 
-## BGV Scheme Support
+## Scheme support (current codebase)
 
-The architecture now supports BGV (Brakerski-Gentry-Vaikuntanathan) scheme for integer operations:
+The **client_server** implementation uses **CKKS only**. There is no BGV or per-step scheme switching in the current code. The server uses `GATEncoderCKKS` from `client_server/server/encoder_ckks.py` and OpenFHE CKKS parameters set in the server and client.
 
-```python
-encoder = GATEncoderFHE(
-    in_channels=4,
-    out_channels=4,
-    scheme="BGV",  # Instead of "CKKS"
-    batch_size=8,
-    mult_depth=15,
-)
-```
+## Relevant files (client_server)
 
-**Use Cases for BGV:**
-- Integer-based computations
-- Monitoring and debugging (exact integer arithmetic)
-- Comparison operations
-- Counter updates
+| Path | Role |
+|------|------|
+| `client_server/server/ckks_runner.py` | FHE pipeline runner (forward, training, bootstrap) |
+| `client_server/server/encoder_ckks.py` | GATEncoderCKKS (linear, attention, LeakyReLU, softmax, aggregation) |
+| `client_server/server/fhe_graph.py` | Encrypted graph representation for CKKS |
+| `client_server/server/fhe_utils_ckks.py` | CKKS helpers (matmul, rotations, etc.) |
+| `client_server/server/metrics.py` | Server-side MetricsRecorder (RSS, time) |
+| `client_server/server/metrics_pi.py` | Raspberry Pi metrics (power, energy) |
+| `client_server/server/utils.py` | CSV writer, RSS, TCP helpers |
+| `client_server/client/metrics.py` | Client-side metrics (keygen, encrypt, decrypt) |
+| `client_server/openfhe_serializer.py` | Serialization for ciphertexts/keys across client–server |
 
-**Note:** BGV is primarily for testing and monitoring. CKKS is recommended for production GAT inference due to its native support for real-valued operations.
+## Command-line usage
 
-## Files Added
-
-1. **`gat_encoder_fhe/metrics.py`**: Metrics recording system
-2. **`gat_encoder_fhe/runner.py`**: Pipeline runner with per-step control
-3. **`examples/pipeline_demo.py`**: Comprehensive demo of pipeline features
-4. **`PIPELINE_ARCHITECTURE.md`**: This file
-
-## Files Modified
-
-1. **`gat_encoder_fhe/__init__.py`**: Export new classes
-2. **`README.md`**: Document new features
-3. **`requirements.txt`**: Updated dependencies
-
-## Command-Line Examples
-
-**Run fully encrypted pipeline:**
+**Plaintext (baseline):**
 ```bash
-python examples/pipeline_demo.py
+python -m client_server.server.plain_server
+python -m client_server.client.plain_client
 ```
 
-**Run with custom graph:**
+**FHE (CKKS):**
 ```bash
-# 1. Generate graph
-python examples/generate_graph.py -n 20 -e 50 -i 8 -o 4 --save graph.npz
-
-# 2. Run pipeline (shows metrics)
-python examples/run_fhe_on_graph.py graph.npz -o 4
+python -m client_server.server.server
+python -m client_server.client.client
 ```
+
+Graph data (e.g. `client_server/client/iot.csv` or a `.npz` graph) is loaded by the client; the server receives serialized inputs over TCP. See the root `README.md` and `client_server/README.md` for setup and options.
 
 ## Best Practices
 
-### Security Prioritization
+### Security (client_server)
 
-Encrypt these steps for maximum security:
-1. **Linear layer** (protects model weights)
-2. **Softmax** (protects attention patterns)
+The FHE path is **fully encrypted** (CKKS). The server never sees the secret key; the client encrypts inputs and decrypts outputs. For a plaintext baseline (no security), use the plain client/server.
 
-Optional:
-3. **Attention scores** (adds more security)
-4. **Aggregation** (minimal security benefit)
+### Performance and memory
 
-### Performance Optimization
-
-For best performance while maintaining reasonable security:
-- Encrypt: Linear + Softmax
-- Decrypt: Attention + LeakyReLU + Aggregation
-- Result: ~2x speedup with 90%+ of security benefits
-
-### Memory Management
-
-Tips for reducing memory usage:
-- Use smaller `batch_size` (4 or 8)
-- Reduce `mult_depth` (12-15 for basic operations)
-- Disable `use_cggi` if scheme switching not needed
-- Process graphs in batches
+- Use smaller `batch_size` (e.g. 4 or 8) to reduce memory.
+- Adjust CKKS parameters (`mult_depth`, `scale_mod_size`) in the server/client as needed.
+- Process graphs in batches; see `client_server/README.md` for batching and throughput.
 
 ## Future Enhancements
 
@@ -269,7 +199,7 @@ Planned improvements:
 
 ## References
 
-- OpenFHE Library: https://github.com/openfheorg/openfhe-development
+- OpenFHE: https://github.com/openfheorg/openfhe-development
 - OpenFHE Python: https://github.com/openfheorg/openfhe-python
-- Edge Hybrid FHE (inspiration): `/home/gerceboss/edge_hybrid/edge_hybrid_fhe/`
-- GAT Paper: [Graph Attention Networks](https://arxiv.org/abs/1710.10903)
+- GAT: [Graph Attention Networks](https://arxiv.org/abs/1710.10903)
+- Repo layout and usage: `README.md`, `client_server/README.md`
