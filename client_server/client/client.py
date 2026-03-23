@@ -392,9 +392,9 @@ def main() -> None:
     parser.add_argument(
         "--max_degree_batch",
         type=int,
-        default=10,
+        default=5,
         metavar="K",
-        help="Cap in-degree per node in each batch (max edges = batch_size*K). Default 10 for FHE memory; use 8--15 for 8GB RAM.",
+        help="Cap in-degree per node in each batch (max edges = batch_size*K). Default 5 for FHE memory; use 8--15 for 8GB RAM.",
     )
     args = parser.parse_args()
 
@@ -618,18 +618,33 @@ def main() -> None:
 
     if not args.host and aggregated_train_metrics:
         write_server_metrics_csv(server_train_metrics_path, aggregated_train_metrics)
-    # Decrypt weight ciphertexts → numpy matrix (F_out, F_in)
-    W_rows = []
-    for ct in ct_W_trained:
-        pt = client_ctx.crypto_context.Decrypt(client_ctx.keys.secretKey, ct)
-        vals = pt.GetRealPackedValue()
-        W_rows.append([float(vals[i]) for i in range(F_in)])
 
-    W_trained = np.array(W_rows, dtype=np.float64)
+    # Decrypt weight ciphertexts → numpy matrix (F_out, F_in) for saving.
+    # Note: decoding can fail when the final ciphertext noise/level is still
+    # too high. Training/inference can still proceed using `ct_W_trained`,
+    # so we skip saving if Decode() fails.
+    decrypt_ok = True
+    W_trained = None
+    try:
+        W_rows = []
+        for ct in ct_W_trained:
+            print("Level:", ct.GetLevel())
+            # print("Scale:", ct.GetScalingFactor())
+            pt = client_ctx.crypto_context.Decrypt(client_ctx.keys.secretKey, ct)
+            vals = pt.GetRealPackedValue()
+            W_rows.append([float(vals[i]) for i in range(F_in)])
+        W_trained = np.array(W_rows, dtype=np.float64)
+    except RuntimeError as exc:
+        decrypt_ok = False
+        print(
+            f"\n[weights] WARNING: decrypting trained weights failed; "
+            f"skipping plaintext weight saving. Error: {exc}"
+        )
+
     a_trained = a
 
     # ── Save trained weights (only after fresh training, not when loading) ───
-    if not args.load_weights:
+    if not args.load_weights and decrypt_ok and W_trained is not None:
         print(f"\n[weights] Saving trained weights → {weights_save_dir} ...")
         from client_server.openfhe_serializer import save_trained_weights
 

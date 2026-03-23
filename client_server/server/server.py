@@ -70,11 +70,15 @@ def _bootstrap_output_cts(
         try:
             current_level = ct.GetLevel()
 
-            if current_level >= bootstrap_level_threshold:
-                ct = crypto_context.EvalBootstrap(ct)
-                n_bootstrapped += 1
-            else:
-                n_skipped += 1
+            print("Current level before bootstrap:", current_level)
+            ct = crypto_context.EvalBootstrap(ct)
+            n_bootstrapped += 1
+            print("Current level after bootstrap:", ct.GetLevel())
+            # if current_level >= bootstrap_level_threshold:
+            #     ct = crypto_context.EvalBootstrap(ct)
+            #     n_bootstrapped += 1
+            # else:
+            #     n_skipped += 1
 
         except Exception as exc:
             print(
@@ -85,6 +89,9 @@ def _bootstrap_output_cts(
             n_failed += 1
 
         refreshed.append(ct)
+
+    print("Output levels after bootstrap:",
+        [ct.GetLevel() for ct in refreshed])
 
     elapsed = time.perf_counter() - t0
     rss_after = rss_bytes()
@@ -188,12 +195,12 @@ def compute_fhe_training_batch(
     # fresh levels.  run_gat_pipeline_fhe_training with bootstrap_weights=True
     # already bootstraps during training, but we do a final check here in case
     # the last epoch left ct_W_list_new at a low level.
-    ct_W_list_new, metrics_dict = _bootstrap_output_cts(
-        crypto_context=crypto_context,
-        out_cts=ct_W_list_new,
-        metrics_dict=metrics_dict,
-        bootstrap_level_threshold=4,
-    )
+    # ct_W_list_new, metrics_dict = _bootstrap_output_cts(
+    #     crypto_context=crypto_context,
+    #     out_cts=ct_W_list_new,
+    #     metrics_dict=metrics_dict,
+    #     bootstrap_level_threshold=4,
+    # )
 
     return ct_W_list_new, metrics_dict
 

@@ -10,7 +10,6 @@ from typing import Any, List
 
 import numpy as np
 
-from .fhe_graph import FHEGraph
 from .fhe_utils_ckks import encrypted_reciprocal_newton_raphson
 
 

@@ -246,9 +246,9 @@ def main() -> None:
     parser.add_argument(
         "--max_degree_batch",
         type=int,
-        default=None,
+        default=10,
         metavar="K",
-        help="Cap in-degree per node in each batch (max edges = batch_size*K). Omit for no cap. For FHE on 8GB use e.g. 8--15.",
+        help="Cap in-degree per node in each batch (max edges = batch_size*K). Default 10 for parity with FHE; use 8--15 for 8GB RAM.",
     )
     args = parser.parse_args()
     batch_csv_rows = []

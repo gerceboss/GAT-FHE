@@ -314,7 +314,10 @@ def make_connected_batches(train_node_ids, edge_index_global, batch_size):
 
     while unvisited:
 
-        seed = unvisited.pop()
+        # Deterministic seed selection so plain and FHE clients produce
+        # identical batches for fair comparisons.
+        seed = min(unvisited)
+        unvisited.remove(seed)
         queue = deque([seed])
         batch = [seed]
 
@@ -322,7 +325,8 @@ def make_connected_batches(train_node_ids, edge_index_global, batch_size):
 
             node = queue.popleft()
 
-            for nb in adj[node]:
+            # Deterministic neighbour traversal order.
+            for nb in sorted(adj[node]):
                 if nb in unvisited:
                     unvisited.remove(nb)
                     queue.append(nb)
@@ -331,6 +335,7 @@ def make_connected_batches(train_node_ids, edge_index_global, batch_size):
                 if len(batch) >= batch_size:
                     break
 
-        batches.append(batch)
+        # Keep deterministic local order inside each batch.
+        batches.append(sorted(batch))
 
     return batches

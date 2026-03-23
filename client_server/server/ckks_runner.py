@@ -156,7 +156,10 @@ def _run_forward_with_intermediates(
             ct_rot = cc.EvalRotate(ct_h_list[i][k], k)
             ct_packed = cc.EvalAdd(ct_packed, ct_rot)
             del ct_rot
+            gc.collect()
         ct_h_packed.append(ct_packed)
+        del ct_packed
+        gc.collect()
 
     del ct_h_list, coeffs
     gc.collect()
