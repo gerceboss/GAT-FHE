@@ -470,7 +470,10 @@ TCP **`_replay_bootstrap_setup`** uses **`levelBudget=[4,4]`** and the payload *
 
 | Mechanism | Default / env | Why |
 | --------- | ------------- | --- |
-| **Early bootstrap on softmax accumulator `acc`** | `GAT_FHE_BOOTSTRAP_EARLY` on; thresholds `GAT_FHE_BOOTSTRAP_THRESHOLD` (train, default 15) vs **`GAT_FHE_BOOTSTRAP_THRESHOLD_INFER`** (infer, default **8**) | Refresh **before** deeper ops on `acc`; **lower infer threshold** triggers earlier on inference-only forwards |
+| **Early bootstrap on per-edge attention `ct_e_ij`** (`encoder_ckks.attention_scores_ckks`) | Same **`GAT_FHE_BOOTSTRAP_EARLY`** and **same train vs infer thresholds** as `acc` | After each edge score, **`EvalBootstrap`** when `GetLevel()` ≥ threshold so noise does not carry into LeakyReLU / softmax stream (train and infer) |
+| **Early bootstrap after LeakyReLU** (`e_after`) | Same flag / thresholds | Per-edge Chebyshev adds depth before softmax is grouped by destination; refresh when level ≥ threshold |
+| **Early bootstrap on softmax denominator `ct_sum`** (sum of exp approx over incoming edges) | Same flag / thresholds | Refresh **inside** the sum loop when level ≥ threshold, plus a final check before **Newton–Raphson reciprocal** |
+| **Early bootstrap on aggregation `acc`** | `GAT_FHE_BOOTSTRAP_EARLY` on; thresholds **`GAT_FHE_BOOTSTRAP_THRESHOLD`** (train) vs **`GAT_FHE_BOOTSTRAP_THRESHOLD_INFER`** (infer) | After **each** incoming edge’s `EvalAdd`, refresh when level ≥ threshold; then training runs sigmoid on `acc` per edge |
 | **Bootstrap after `ct_h_packed`** | **`GAT_FHE_BOOTSTRAP_AFTER_PACK`** — **on by default**; set `0`/`false`/`no` to disable | **Targeted** refresh of one ciphertext per line-graph node **after** linear + attention + LeakyReLU pack, **before** softmax stream; expensive (`num_nodes` × `EvalBootstrap` per forward) but improves decode margin |
 | **Debug ciphertext state** | `GAT_FHE_DEBUG_CT=1` | Prints `GetLevel()` / `GetNoiseScaleDeg()` at key points (interpret with care; OpenFHE’s `GetLevel()` is not always intuitive) |
 
@@ -501,7 +504,7 @@ In **in-process** mode, plaintext and FHE clients can both record **server-style
 | Variable | Purpose |
 | -------- | ------- |
 | `GAT_FHE_DEBUG_CT` | Verbose ciphertext state prints |
-| `GAT_FHE_BOOTSTRAP_EARLY` | Enable early refresh on accumulator `acc` |
+| `GAT_FHE_BOOTSTRAP_EARLY` | Enable early refresh on per-edge attention `ct_e_ij` and on softmax accumulator `acc` |
 | `GAT_FHE_BOOTSTRAP_THRESHOLD` | Training: level trigger for early bootstrap (default 15) |
 | `GAT_FHE_BOOTSTRAP_THRESHOLD_INFER` | Inference: lower trigger (default 8) |
 | `GAT_FHE_BOOTSTRAP_AFTER_PACK` | Bootstrap each `ct_h_packed[i]` after pack (**default on**; `0`/`false`/`no` disables) |

@@ -10,7 +10,11 @@ from typing import Any, List
 
 import numpy as np
 
-from .fhe_utils_ckks import encrypted_reciprocal_newton_raphson
+from .fhe_utils_ckks import (
+    early_bootstrap_enabled,
+    early_bootstrap_threshold_for_path,
+    encrypted_reciprocal_newton_raphson,
+)
 
 
 def _try_import_openfhe():
@@ -108,12 +112,15 @@ class GATEncoderCKKS:
         ct_h_list: List[List[Any]],
         edge_index: np.ndarray,
         num_nodes: int,
+        *,
+        training: bool = True,
     ) -> List[Any]:
         E = edge_index.shape[1]
         F_out = len(ct_h_list[0])
         ct_e_list = []
         a_concat = self._a
         _gc_interval = max(1, E // 20)
+        _thr = early_bootstrap_threshold_for_path(training)
         for e in range(E):
             i, j = edge_index[0, e], edge_index[1, e]
             ct_h_i_packed = None
@@ -141,6 +148,12 @@ class GATEncoderCKKS:
             del ct_concat, pt_a, a_padded
             ct_e_ij = self._sum_slots_via_rotations(ct_weighted, 2 * F_out)
             del ct_weighted
+            if early_bootstrap_enabled():
+                try:
+                    if int(ct_e_ij.GetLevel()) >= _thr:
+                        ct_e_ij = self._cc.EvalBootstrap(ct_e_ij)
+                except Exception:
+                    pass
             ct_e_list.append(ct_e_ij)
             if (e + 1) % _gc_interval == 0:
                 gc.collect()

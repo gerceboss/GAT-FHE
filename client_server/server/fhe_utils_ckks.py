@@ -1,8 +1,39 @@
 """
-CKKS-only FHE utils: Newton-Raphson reciprocal, Chebyshev coefficients.
+CKKS-only FHE utils: Newton-Raphson reciprocal, Chebyshev coefficients,
+early-bootstrap env toggles (shared by ckks_runner and encoder_ckks).
 """
 
+import os
 from typing import Any
+
+
+def early_bootstrap_enabled() -> bool:
+    return os.environ.get("GAT_FHE_BOOTSTRAP_EARLY", "").strip() not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+
+def early_bootstrap_threshold() -> int:
+    try:
+        return int(os.environ.get("GAT_FHE_BOOTSTRAP_THRESHOLD", "15"))
+    except Exception:
+        return 15
+
+
+def early_bootstrap_threshold_for_path(training: bool) -> int:
+    """
+    Training: GAT_FHE_BOOTSTRAP_THRESHOLD (default 15).
+    Inference: GAT_FHE_BOOTSTRAP_THRESHOLD_INFER (default 8) — refresh sooner.
+    """
+    if training:
+        return early_bootstrap_threshold()
+    try:
+        return max(1, int(os.environ.get("GAT_FHE_BOOTSTRAP_THRESHOLD_INFER", "8")))
+    except Exception:
+        return 8
 
 
 def encrypted_reciprocal_newton_raphson(

@@ -904,7 +904,10 @@ def main() -> None:
     Tdec = sum(r["client_decryption_time"] for r in batch_csv_rows)
 
     Ttotal = Tenc + Tserver + Tdec
-    Energy_total = sum(r["server_energy_joules"] for r in batch_csv_rows)
+    Energy_total = sum(
+        r.get("energy_joules", r.get("server_energy_joules", 0.0))
+        for r in batch_csv_rows
+    )
 
     Energy_per_batch = Energy_total / len(batch_csv_rows) if batch_csv_rows else 0.0
     Energy_per_node = Energy_total / len(all_labels) if all_labels else 0.0
