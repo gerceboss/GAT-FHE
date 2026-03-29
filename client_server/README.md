@@ -120,7 +120,8 @@ write plain_batch_metrics_<ts>.csv, plain_summary_<ts>.csv
 | *(default)*       | Train then infer                                   |
 | `--train_only`    | Train, save weights, exit — no inference           |
 | `--infer_only`    | Load saved weights, run inference — skip training  |
-| `--load_weights`  | Skip training, use saved `plain_weights.pt`        |
+| `--load_weights`  | Skip training; loads `plain_weights.pt` from the given dir, or from `last_successful_checkpoint.txt` / newest `batch_*` under a parent dir (same resolution pattern as FHE checkpoints) |
+| `--save_weights`  | Per-batch `batch_XXXX/plain_weights.pt` + `meta.json`, updates `last_successful_checkpoint.txt`; also writes root `plain_weights.pt` after training |
 
 ### Batch construction (line-graph, node-based)
 
@@ -412,13 +413,99 @@ connection received
 | `mult_depth`     | 25      | Levels available before bootstrapping is required           |
 | `scale_mod_size` | 50      | Scaling factor precision in bits. 50 = ~15 decimal digits   |
 | `slots`          | 8       | CKKS packed values per ciphertext (max = N/2 = 8192)        |
-| `levelBudget`    | [4, 4]  | Bootstrap levels consumed in forward / backward pass        |
+| `levelBudget`    | [4, 4]  | Bootstrap encoding/decoding budget (must match serializer / TCP replay) |
 
 Disable bootstrapping (shallow parameter sets, unit tests):
 
 ```bash
 --no_bootstrap
 ```
+
+When bootstrapping is enabled, **`SetMultiplicativeDepth`** uses **`mult_depth + bootstrap_depth`** (bootstrap depth from `GetBootstrapDepth(levelBudget, …)`), not `mult_depth` alone — otherwise the modulus chain is too short for refresh (`DropLastElement`, etc.).
+
+**CLI tuning:** `--scale_mod_size` (default 50) sets CKKS scaling precision; **`SetFirstModSize`** is **`max(60, scale_mod_size)`** so the first modulus is never below the scaling modulus (OpenFHE requirement).
+
+---
+
+## FHE implementation notes — current behavior & rationale
+
+This section lists behaviors that were added or tightened for **memory**, **determinism**, **CKKS decode stability**, and **client–server parity**. It complements the architecture diagrams above.
+
+### Batching and line-graph subgraphs
+
+| Mechanism | What it does | Why |
+| --------- | -------------- | --- |
+| **`make_connected_batches(train_line_ids, edge_index, batch_size)`** | Partitions line-graph nodes into batches by **BFS from deterministic seeds** (`min(unvisited)`), sorted neighbors | Smaller, more local subgraphs than random chunks; **deterministic** plain vs FHE; fewer cross-batch edges for fair comparison |
+| **`build_line_graph_batch(..., max_degree_per_node=K)`** | Caps **in-degree** per node in the batch subgraph | Limits **edges in the batch** (~`batch_size × K`); dense line graphs blow up FHE attention memory and depth |
+| **No 1-hop neighbor expansion** | Batch includes only selected line-graph nodes and edges between them | Earlier “+ all neighbors” batches were huge; removed for RAM |
+
+**Output labels:** logs use **line-graph nodes** (batch of original edges) and **edges in line-graph nodes** (internal edges used for attention), not ambiguous “targets / subgraph_nodes”.
+
+### One round-trip per batch (training and inference)
+
+Each training mini-batch and each inference mini-batch does **encrypt → server compute → return → client decrypt** (or weight update) **before** the next batch starts. **In-process** mode uses direct function calls; **TCP** opens **one connection per batch** (`b"G"` train step, `b"I"` infer). Nothing queues multiple test batches on the server.
+
+### Inference: fresh weight encryption each batch (default)
+
+When plaintext **`W`** is available (`--load_weights` from `W.npy`, or after training if weight decrypt succeeded), the client **re-encrypts `W` every inference batch** and sends new `ct_W_list` handles.
+
+| Why | Detail |
+| --- | ------ |
+| **Stale handles** | Server `compute_forward_only` may replace weight ciphertexts with bootstrapped objects **only in its copy**; the client’s old list entries can point at **pre-bootstrap** ciphertexts on the next batch |
+| **Full CKKS level** | Fresh encryption starts at a **full** modulus chain for weights; reusing depleted ciphertexts worsens noise in `EvalMult` with features |
+
+**Opt out (faster, riskier):** `--reuse_encrypted_weights_infer` reuses the same ciphertext handles across batches.
+
+### Server `compute_forward_only()` (inference path)
+
+| Behavior | Why |
+| -------- | --- |
+| **`bootstrap_weights=True` by default** (disable with `bootstrap_weights=False` or env `GAT_FHE_INFER_BOOTSTRAP_WEIGHTS=0`) | Mirrors **post-epoch weight refresh** in training so the forward starts from refreshed weights |
+| **`bootstrap_level_threshold=0` by default** for output bootstrap | **Always** run `EvalBootstrap` on each returned output logit ciphertext before sending to the client; stricter than a positive threshold and helps client **Decode()** |
+| **`_bootstrap_output_cts`** on returned outputs | Reduces “approximation error is too high” when remaining precision is marginal |
+
+TCP **`_replay_bootstrap_setup`** uses **`levelBudget=[4,4]`** and the payload **`slots`**, matching **`client_keys.create_client_context`** (tables must match or bootstrap fails / misbehaves).
+
+### Pipeline bootstrapping (`ckks_runner.py`)
+
+| Mechanism | Default / env | Why |
+| --------- | ------------- | --- |
+| **Early bootstrap on softmax accumulator `acc`** | `GAT_FHE_BOOTSTRAP_EARLY` on; thresholds `GAT_FHE_BOOTSTRAP_THRESHOLD` (train, default 15) vs **`GAT_FHE_BOOTSTRAP_THRESHOLD_INFER`** (infer, default **8**) | Refresh **before** deeper ops on `acc`; **lower infer threshold** triggers earlier on inference-only forwards |
+| **Bootstrap after `ct_h_packed`** | **`GAT_FHE_BOOTSTRAP_AFTER_PACK`** — **on by default**; set `0`/`false`/`no` to disable | **Targeted** refresh of one ciphertext per line-graph node **after** linear + attention + LeakyReLU pack, **before** softmax stream; expensive (`num_nodes` × `EvalBootstrap` per forward) but improves decode margin |
+| **Debug ciphertext state** | `GAT_FHE_DEBUG_CT=1` | Prints `GetLevel()` / `GetNoiseScaleDeg()` at key points (interpret with care; OpenFHE’s `GetLevel()` is not always intuitive) |
+
+Training still runs **per-epoch weight bootstrap** and (in `server.py`) **forced bootstrap on returned weight ciphertexts** when `bootstrap_weights` is enabled so the client receives refreshable weights.
+
+### Client-side decryption (`client_keys.py`)
+
+| Mechanism | Why |
+| --------- | --- |
+| **`decrypt_node_features_rows_with_retry`** | On CKKS **Decode()** failure, **`EvalBootstrap` per row** and retry (fixed cap: 16 rounds in `client_keys.py`). One client-side bootstrap after the server is often insufficient |
+
+This addresses **output** decryption; it does not fix bad CKKS parameters by itself.
+
+### Training checkpoints & `--load_weights`
+
+| Mechanism | Why |
+| --------- | --- |
+| **`--save_weights`** | Saves plaintext **`W`** (+ `a`, meta) when decrypt succeeds; optional bootstrap retry before decrypt |
+| **`last_successful_checkpoint.txt`** | Points to the last good **`batch_XXXX`** if later batches fail to decrypt |
+| **`--load_weights`** | Resolves to latest checkpoint directory; **re-encrypts plaintext `W`** with **new** keygen (fresh context) for that run |
+
+### Metrics (plain vs FHE)
+
+In **in-process** mode, plaintext and FHE clients can both record **server-style** CSV metrics so experiments are comparable. FHE filenames follow **`server_fhe_metrics_train_*`**, **`server_fhe_metrics_infer_*`**, **`client_fhe_metrics_*`**, **`fhe_batch_metrics_*`**, **`fhe_summary_*`**.
+
+### Environment variable quick reference (FHE)
+
+| Variable | Purpose |
+| -------- | ------- |
+| `GAT_FHE_DEBUG_CT` | Verbose ciphertext state prints |
+| `GAT_FHE_BOOTSTRAP_EARLY` | Enable early refresh on accumulator `acc` |
+| `GAT_FHE_BOOTSTRAP_THRESHOLD` | Training: level trigger for early bootstrap (default 15) |
+| `GAT_FHE_BOOTSTRAP_THRESHOLD_INFER` | Inference: lower trigger (default 8) |
+| `GAT_FHE_BOOTSTRAP_AFTER_PACK` | Bootstrap each `ct_h_packed[i]` after pack (**default on**; `0`/`false`/`no` disables) |
+| `GAT_FHE_INFER_BOOTSTRAP_WEIGHTS` | `0`/`false`/`no` skips pre-forward weight bootstrap in `compute_forward_only` |
 
 ---
 
@@ -516,6 +603,16 @@ if bootstrap_output:
 
 This prevents the `"approximation error is too high"` decryption failure that occurs when a ciphertext with near-zero remaining level is decrypted — the CKKS error bound explodes when the scaling chain is exhausted.
 
+### After packed node embeddings (`ct_h_packed`) — **on by default**
+
+Inside `_run_forward_with_intermediates()`, after linear → attention → LeakyReLU, node embeddings are **packed** into one ciphertext per node (`ct_h_packed`). The runner then **by default** runs **`EvalBootstrap` on each** of those ciphertexts (**`num_nodes` bootstraps per forward**) before the softmax / aggregation loop. This is a **targeted** refresh to reduce noise before the deepest part of the forward.
+
+- **Environment only (no CLI flag):** `GAT_FHE_BOOTSTRAP_AFTER_PACK`
+  - **Default:** enabled (unset or any value other than the disable list below).
+  - **Disable:** `GAT_FHE_BOOTSTRAP_AFTER_PACK=0` or `false` or `no` for faster runs when CKKS parameters and batch size already give enough decode margin.
+
+Metrics step name: `4_bootstrap_after_pack` (appears in batch metrics alongside `1_linear`, `2_attention`, `3_leakyrelu`).
+
 ### How Bootstrapping Reduces Memory Usage
 
 Each bootstrapped ciphertext is replaced in-place. The critical effect on RAM is:
@@ -568,7 +665,7 @@ Peak RAM is therefore `O(batch_size × F_in × sizeof(ciphertext))` rather than 
 
 ### Slot Packing Reduces Ciphertext Count
 
-Using `slots = 8` means each node's feature vector (`F_in = 5`) fits in a single ciphertext with 3 zero-padding slots. The alternative — one ciphertext per feature — would multiply ciphertext count by `F_in`, increasing RAM and compute by 5×.
+Using `slots = 8` means each node's feature vector (`F_in = 3` for src_bytes, dst_bytes, duration) fits in a single ciphertext with padding. The alternative — one ciphertext per feature — would multiply ciphertext count by `F_in`.
 
 ---
 
@@ -667,7 +764,7 @@ All FHE metrics use the same standard columns: `step`, `server_time`, `client_ti
 
 ### Server-Side Training CSV (`server_fhe_train_metrics_<ts>.csv` / `server_fhe_grad_metrics_<ts>.csv`)
 
-Each row is a server step; `server_time` is the step duration, `client_time` is 0. Example step names: `batch_0_1_linear`, `batch_0_2_attention`, `batch_0_3_leakyrelu`, `batch_0_epoch_1_forward_backward_stream`, `batch_0_epoch_1_weight_update`, `batch_0_epoch_1_bootstrap_weights`, `batch_0_fhe_output_bootstrap`.
+Each row is a server step; `server_time` is the step duration, `client_time` is 0. Example step names: `batch_0_1_linear`, `batch_0_2_attention`, `batch_0_3_leakyrelu`, `batch_0_4_bootstrap_after_pack`, `batch_0_epoch_1_forward_backward_stream`, `batch_0_epoch_1_weight_update`, `batch_0_epoch_1_bootstrap_weights`, `batch_0_fhe_output_bootstrap`.
 
 ### Client-Side FHE Batch CSV (`fhe_batch_metrics_<ts>.csv`)
 
@@ -778,11 +875,13 @@ hostname -I   # on server
 
 ## FHE Decryption Error — `approximation error is too high`
 
-Occurs when a ciphertext's remaining multiplicative level is too low to support CKKS decoding. Causes:
+Occurs when **noise / precision** is outside CKKS **Decode()** tolerance (not always a single “level count”). Causes:
 
-- `mult_depth` is too small for the number of epochs (increase `--mult_depth`)
-- Bootstrapping is disabled and levels are exhausted (remove `--no_bootstrap`)
-- `bootstrap_level_threshold` is too low (levels not refreshed soon enough)
+- **`mult_depth` / ring / scale too small** for the graph batch (increase `--mult_depth`, try higher `--scale_mod_size` or `--ring_dim` if RAM allows)
+- Bootstrapping disabled (`--no_bootstrap`) so the chain is exhausted
+- **Outputs** are harder to decode than **weights**; use **per-batch fresh weight encrypt** (default when plaintext `W` exists), **`GAT_FHE_BOOTSTRAP_AFTER_PACK`** (on by default), output bootstrap in `compute_forward_only`, and client **`decrypt_node_features_rows_with_retry`**
+
+See **§ FHE implementation notes — current behavior & rationale** above for the full list.
 
 Quick diagnostic:
 

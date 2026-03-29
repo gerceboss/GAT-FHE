@@ -27,7 +27,7 @@ def get_leaky_relu_chebyshev_coefficients(
     negative_slope: float = 0.2,
     domain_low: float = -3.0,
     domain_high: float = 3.0,
-    degree: int = 3,
+    degree: int = 2,
 ) -> list:
     """Chebyshev coefficients for LeakyReLU in CKKS."""
     import numpy as np
@@ -41,7 +41,7 @@ def get_leaky_relu_chebyshev_coefficients(
 def get_sigmoid_chebyshev_coefficients(
     domain_low: float = -5.0,
     domain_high: float = 5.0,
-    degree: int = 3,
+    degree: int = 2,
 ) -> list:
     """Chebyshev coefficients for sigmoid in CKKS."""
     import numpy as np

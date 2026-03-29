@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pickle
 import socket
@@ -56,6 +57,65 @@ from client_server.client.utils import (
     load_iot_edge_train_test,
     make_connected_batches,
 )
+
+
+def _resolve_plain_load_weights_dir(path_like: str) -> str:
+    """
+    Resolve checkpoint directory for --load_weights (parity with FHE client):
+      - directory that already contains plain_weights.pt, or
+      - parent with last_successful_checkpoint.txt → batch_XXXX/, or
+      - parent with batch_* subdirs → newest batch_* containing plain_weights.pt.
+    """
+    p = Path(path_like)
+    if (p / "plain_weights.pt").exists():
+        return str(p.resolve())
+
+    pointer = p / "last_successful_checkpoint.txt"
+    if pointer.exists():
+        rel = pointer.read_text(encoding="utf-8").strip()
+        if rel:
+            cand = (p / rel).resolve()
+            if (cand / "plain_weights.pt").exists():
+                return str(cand)
+
+    candidates: List[Tuple[int, Path]] = []
+    for d in p.glob("batch_*"):
+        if d.is_dir() and (d / "plain_weights.pt").exists():
+            try:
+                idx = int(d.name.split("_")[-1])
+            except Exception:
+                idx = -1
+            candidates.append((idx, d))
+    if candidates:
+        candidates.sort(key=lambda t: t[0])
+        return str(candidates[-1][1].resolve())
+    return str(p.resolve())
+
+
+def _save_plain_checkpoint(
+    save_root: str,
+    batch_index: int,
+    W: np.ndarray,
+    a: np.ndarray,
+    f_in: int,
+    f_out: int,
+) -> str:
+    """Write batch_XXXX/plain_weights.pt + meta.json and update last_successful_checkpoint.txt."""
+    root = Path(save_root)
+    ckpt_dir = root / f"batch_{batch_index:04d}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"W": torch.tensor(W), "a": torch.tensor(a)},
+        ckpt_dir / "plain_weights.pt",
+    )
+    meta = {"F_in": f_in, "F_out": f_out, "mode": "plain"}
+    (ckpt_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "last_successful_checkpoint.txt").write_text(
+        f"batch_{batch_index:04d}\n",
+        encoding="utf-8",
+    )
+    return str(ckpt_dir)
 
 
 def tcp_gradient_step(host, port, payload):
@@ -214,7 +274,8 @@ def main() -> None:
         type=str,
         default=None,
         metavar="DIR",
-        help="Directory to save trained plaintext weights after training."
+        help="Directory for per-batch checkpoints (batch_XXXX/plain_weights.pt + meta.json) "
+        "and last_successful_checkpoint.txt; also writes top-level plain_weights.pt after training.",
     )
 
     parser.add_argument(
@@ -222,8 +283,9 @@ def main() -> None:
         type=str,
         default=None,
         metavar="DIR",
-        help="Directory to load previously saved plaintext weights. "
-            "Skips training."
+        help="Checkpoint dir (plain_weights.pt), or parent dir with batch_*/ "
+        "and optional last_successful_checkpoint.txt (same resolution as FHE). "
+        "Skips training.",
     )
 
     parser.add_argument(
@@ -311,8 +373,9 @@ def main() -> None:
     a = rng.standard_normal((2 * OUT_CHANNELS,)).astype(np.float64) * 0.1
 
     if args.load_weights:
-        print(f"\n[weights] Loading plaintext weights from {args.load_weights}")
-        weights_path = os.path.join(args.load_weights, "plain_weights.pt")
+        resolved_w = _resolve_plain_load_weights_dir(args.load_weights)
+        print(f"\n[weights] Loading plaintext weights from: {resolved_w}")
+        weights_path = os.path.join(resolved_w, "plain_weights.pt")
         if not os.path.exists(weights_path):
             raise FileNotFoundError(f"No weights found at {weights_path}")
         ckpt = torch.load(weights_path)
@@ -393,13 +456,24 @@ def main() -> None:
             })
             print(f"      Completed {args.epochs} epochs  server_t={server_t:.4f}s")
 
+            if args.save_weights:
+                ckpt_dir = _save_plain_checkpoint(
+                    str(args.save_weights),
+                    b_idx,
+                    W,
+                    a,
+                    IN_CHANNELS,
+                    OUT_CHANNELS,
+                )
+                print(f"[weights] Checkpoint saved → {ckpt_dir}")
+
         train_time = time.perf_counter() - _train_t0
         if args.save_weights:
             os.makedirs(args.save_weights, exist_ok=True)
             torch.save({
                 "W": torch.tensor(W), "a": torch.tensor(a),
             }, os.path.join(args.save_weights, "plain_weights.pt"))
-            print(f"[weights] Saved → {args.save_weights}")
+            print(f"[weights] Final weights saved → {os.path.join(args.save_weights, 'plain_weights.pt')}")
         if not args.host and all_train_metrics_rows:
             from client_server.server.utils import write_metrics_csv
             write_metrics_csv(f"server_train_metrics_{ts}.csv", all_train_metrics_rows)

@@ -9,6 +9,52 @@ from typing import Any
 
 import numpy as np
 
+# Client-side EvalBootstrap retries per output row after CKKS Decode() failure.
+_INFER_DECRYPT_MAX_BOOTSTRAP_ROUNDS = 16
+
+
+def _is_ckks_decode_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return "approximation error" in s or "decode()" in s or "decode:" in s
+
+
+def decrypt_node_features_rows_with_retry(
+    crypto_context: Any,
+    secret_key: Any,
+    ct_list: list[Any],
+    feature_dim: int,
+) -> np.ndarray:
+    """
+    Decrypt packed CKKS ciphertexts (one row per ct). On Decode() failure,
+    call EvalBootstrap on that row and retry up to _INFER_DECRYPT_MAX_BOOTSTRAP_ROUNDS times.
+    """
+    max_bootstrap_rounds = _INFER_DECRYPT_MAX_BOOTSTRAP_ROUNDS
+    cc = crypto_context
+    sk = secret_key
+    N = len(ct_list)
+    x = np.zeros((N, feature_dim), dtype=np.float64)
+    for i in range(N):
+        ct = ct_list[i]
+        last_err: BaseException | None = None
+        for _round in range(max_bootstrap_rounds + 1):
+            try:
+                pt = cc.Decrypt(sk, ct)
+                pt.SetLength(feature_dim)
+                vals = pt.GetCKKSPackedValue()
+                x[i] = np.real([complex(v).real for v in vals[:feature_dim]])
+                last_err = None
+                break
+            except RuntimeError as e:
+                last_err = e
+                if not _is_ckks_decode_error(e):
+                    raise
+                if _round >= max_bootstrap_rounds:
+                    break
+                ct = cc.EvalBootstrap(ct)
+        if last_err is not None:
+            raise last_err
+    return x
+
 
 def _openfhe_symbols():
     try:
@@ -78,6 +124,18 @@ class ClientKeysContext:
             x[i] = np.real([complex(v).real for v in vals[:feature_dim]])
         return x
 
+    def decrypt_node_features_with_bootstrap_retry(
+        self,
+        ct_list: list[Any],
+        feature_dim: int,
+    ) -> np.ndarray:
+        return decrypt_node_features_rows_with_retry(
+            self.crypto_context,
+            self.keys.secretKey,
+            ct_list,
+            feature_dim,
+        )
+
     def decrypt_weight_matrix(self, ct_list: list[Any], in_channels: int) -> np.ndarray:
         cc = self.crypto_context
         sk = self.keys.secretKey
@@ -131,20 +189,26 @@ def create_client_context(
         )
 
     params.SetScalingModSize(scale_mod_size)
-    params.SetFirstModSize(60)
+    # OpenFHE requires FirstModSize >= ScalingModSize.
+    # Keep a small cushion so users can raise --scale_mod_size safely.
+    params.SetFirstModSize(max(60, int(scale_mod_size)))
     params.SetBatchSize(slots)
     params.SetSecretKeyDist(SecretDist.UNIFORM_TERNARY)
     params.SetScalingTechnique(Scaling.FLEXIBLEAUTO)
     params.SetKeySwitchTechnique(KeySwitch.HYBRID)
 
     if bootstrap:
-        # Depth = levels for one epoch + bootstrap overhead. Bootstrap after each epoch.
+        # When bootstrapping is enabled we must allocate enough depth for:
+        # - the intended compute (mult_depth)
+        # - bootstrap overhead (depends on level_budget and secret distribution)
+        #
+        # So the *actual* CKKS chain depth is mult_depth + bootstrap_depth.
         level_budget = [4, 4]
         try:
             bootstrap_depth = openfhe.FHECKKSRNS.GetBootstrapDepth(level_budget, SecretDist.UNIFORM_TERNARY)
         except Exception:
             bootstrap_depth = 10
-        total_depth = mult_depth + bootstrap_depth
+        total_depth = int(mult_depth) + int(bootstrap_depth)
         params.SetMultiplicativeDepth(total_depth)
     else:
         params.SetMultiplicativeDepth(mult_depth)

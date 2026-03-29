@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 import numpy as np
 import gc
+import os
 
 from .encoder_ckks import GATEncoderCKKS
 from .fhe_graph import FHEGraph
@@ -17,6 +18,67 @@ from .fhe_utils_ckks import (
     get_sigmoid_chebyshev_coefficients,
 )
 from .metrics import MetricsRecorder
+
+
+def _ct_state(ct: Any) -> dict[str, int]:
+    """Best-effort ciphertext state for debugging depth/noise."""
+    out: dict[str, int] = {}
+    try:
+        out["ct_level"] = int(ct.GetLevel())
+    except Exception:
+        out["ct_level"] = -1
+    try:
+        out["ct_noise_scale_deg"] = int(ct.GetNoiseScaleDeg())
+    except Exception:
+        out["ct_noise_scale_deg"] = -1
+    return out
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("GAT_FHE_DEBUG_CT", "").strip() not in ("", "0", "false", "False")
+
+
+def _debug_print_ct(prefix: str, ct: Any) -> None:
+    if not _debug_enabled():
+        return
+    s = _ct_state(ct)
+    print(f"[ct] {prefix} level={s['ct_level']} noise_scale_deg={s['ct_noise_scale_deg']}")
+
+
+def _early_bootstrap_enabled() -> bool:
+    return os.environ.get("GAT_FHE_BOOTSTRAP_EARLY", "").strip() not in ("", "0", "false", "False")
+
+
+def _early_bootstrap_threshold() -> int:
+    try:
+        return int(os.environ.get("GAT_FHE_BOOTSTRAP_THRESHOLD", "15"))
+    except Exception:
+        return 15
+
+
+def _bootstrap_after_pack_enabled() -> bool:
+    """
+    After ct_h_packed is built, EvalBootstrap each packed node embedding (num_nodes calls).
+    Default: on. Disable with GAT_FHE_BOOTSTRAP_AFTER_PACK=0|false|no (faster; less refresh).
+    """
+    v = os.environ.get("GAT_FHE_BOOTSTRAP_AFTER_PACK", "").strip().lower()
+    if v in ("0", "false", "no"):
+        return False
+    return True
+
+
+def _early_bootstrap_threshold_for_path(training: bool) -> int:
+    """
+    Training uses GAT_FHE_BOOTSTRAP_THRESHOLD (default 15).
+    Inference uses GAT_FHE_BOOTSTRAP_THRESHOLD_INFER (default 8) so early
+    refresh triggers sooner and noise does not accumulate as far before output bootstrap.
+    """
+    if training:
+        return _early_bootstrap_threshold()
+    try:
+        return max(1, int(os.environ.get("GAT_FHE_BOOTSTRAP_THRESHOLD_INFER", "8")))
+    except Exception:
+        return 8
 
 
 def run_gat_forward_only(
@@ -54,7 +116,7 @@ def run_gat_pipeline_fhe_training(
     cc = encoder.crypto_context
 
     sigmoid_coeffs = get_sigmoid_chebyshev_coefficients(
-        domain_low=-5.0, domain_high=5.0, degree=3
+        domain_low=-3.0, domain_high=3.0, degree=2
     )
 
     for epoch in range(num_epochs):
@@ -89,13 +151,22 @@ def run_gat_pipeline_fhe_training(
 
         gc.collect()
 
+        # ---- bootstrap weights AFTER update so next epoch starts fresh ----
         if bootstrap_weights:
             with metrics.step(f"epoch_{epoch+1}_bootstrap_weights", encrypted=True):
                 for k in range(encoder.out_channels):
-                    encoder._ct_W_list[k] = cc.EvalBootstrap(
-                        encoder._ct_W_list[k]
-                    )
+                    _debug_print_ct(f"epoch{epoch+1} W{k} pre_bootstrap", encoder._ct_W_list[k])
+                    encoder._ct_W_list[k] = cc.EvalBootstrap(encoder._ct_W_list[k])
+                    _debug_print_ct(f"epoch{epoch+1} W{k} post_bootstrap", encoder._ct_W_list[k])
             gc.collect()
+
+        # if bootstrap_weights:
+        #     with metrics.step(f"epoch_{epoch+1}_bootstrap_weights", encrypted=True):
+        #         for k in range(encoder.out_channels):
+        #             encoder._ct_W_list[k] = cc.EvalBootstrap(
+        #                 encoder._ct_W_list[k]
+        #             )
+        #     gc.collect()
 
         if print_metrics:
             print(f"  FHE epoch {epoch+1}/{num_epochs} (streaming)")
@@ -126,12 +197,16 @@ def _run_forward_with_intermediates(
     # ---- LINEAR ----
     with metrics.step("1_linear", encrypted=True):
         ct_h_list = [encoder._matmul_ckks_dispatch(ct_x) for ct_x in ct_x_list]
+    if _debug_enabled() and ct_h_list and ct_h_list[0]:
+        _debug_print_ct("after linear h[0][0]", ct_h_list[0][0])
 
     # ---- ATTENTION ----
     with metrics.step("2_attention", encrypted=True):
         attention_scores = encoder.attention_scores_ckks(
             ct_h_list, edge_index, num_nodes
         )
+    if _debug_enabled() and attention_scores:
+        _debug_print_ct("after attention e[0]", attention_scores[0])
 
     # ---- LEAKY RELU ----
     with metrics.step("3_leakyrelu", encrypted=True):
@@ -139,7 +214,7 @@ def _run_forward_with_intermediates(
             negative_slope=encoder.negative_slope,
             domain_low=-3.0,
             domain_high=3.0,
-            degree=3,
+            degree=2,
         )
         e_after = [
             cc.EvalChebyshevSeries(ct_e, coeffs, -3.0, 3.0)
@@ -147,6 +222,8 @@ def _run_forward_with_intermediates(
         ]
     del attention_scores
     gc.collect()
+    if _debug_enabled() and e_after:
+        _debug_print_ct("after leakyrelu e_after[0]", e_after[0])
 
     # ---- PACK NODE EMBEDDINGS ----
     ct_h_packed = []
@@ -160,6 +237,17 @@ def _run_forward_with_intermediates(
         ct_h_packed.append(ct_packed)
         del ct_packed
         gc.collect()
+
+    # ---- REFRESH PACKED EMBEDDINGS (default on; targeted decode-margin vs softmax path) ----
+    if _bootstrap_after_pack_enabled():
+        with metrics.step("4_bootstrap_after_pack", encrypted=True):
+            for i in range(num_nodes):
+                if _debug_enabled():
+                    _debug_print_ct(f"ct_h_packed[{i}] pre_bootstrap", ct_h_packed[i])
+                ct_h_packed[i] = cc.EvalBootstrap(ct_h_packed[i])
+                if _debug_enabled():
+                    _debug_print_ct(f"ct_h_packed[{i}] post_bootstrap", ct_h_packed[i])
+            gc.collect()
 
     del ct_h_list, coeffs
     gc.collect()
@@ -204,6 +292,8 @@ def _run_forward_with_intermediates(
 
         acc = None
 
+        early_bootstrapped = False
+
         for k, edge_idx in enumerate(edge_indices):
 
             alpha_ij = cc.EvalMult(ct_exp_local[k], ct_recip)
@@ -219,6 +309,19 @@ def _run_forward_with_intermediates(
 
             # ---- STREAM BACKWARD ----
             if training and train_mask[t]:
+                # Optional stability trick: bootstrap intermediate accumulator earlier,
+                # before applying deeper polynomial approximations (sigmoid).
+                if _early_bootstrap_enabled():
+                    try:
+                        if (not early_bootstrapped) and int(acc.GetLevel()) >= _early_bootstrap_threshold_for_path(True):
+                            if _debug_enabled():
+                                _debug_print_ct(f"t{t} acc pre_early_bootstrap", acc)
+                            acc = cc.EvalBootstrap(acc)
+                            early_bootstrapped = True
+                            if _debug_enabled():
+                                _debug_print_ct(f"t{t} acc post_early_bootstrap", acc)
+                    except Exception:
+                        pass
                 ct_sig = cc.EvalChebyshevSeries(
                     acc, sigmoid_coeffs, -5.0, 5.0
                 )
@@ -236,6 +339,20 @@ def _run_forward_with_intermediates(
                             grad_W_enc[out_k], grad_term
                         )
                     del grad_term
+            elif not training:
+                # Inference: same early refresh as training (before sigmoid in train path)
+                # so the per-node accumulator does not exhaust depth / noise before output bootstrap.
+                if _early_bootstrap_enabled():
+                    try:
+                        if (not early_bootstrapped) and int(acc.GetLevel()) >= _early_bootstrap_threshold_for_path(False):
+                            if _debug_enabled():
+                                _debug_print_ct(f"t{t} acc pre_early_bootstrap (infer)", acc)
+                            acc = cc.EvalBootstrap(acc)
+                            early_bootstrapped = True
+                            if _debug_enabled():
+                                _debug_print_ct(f"t{t} acc post_early_bootstrap (infer)", acc)
+                    except Exception:
+                        pass
 
         # Guard: if acc is still None despite non-empty edge_indices (e.g. all
         # src indices were out-of-range), fall back to an encrypted zero so we

@@ -25,13 +25,17 @@ Run TCP server:
 
 from __future__ import annotations
 
+import gc
 import socket
 import sys
 import threading
 import time
 import traceback
+import os
 from pathlib import Path
 from typing import Any
+
+import openfhe
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 if str(ROOT) not in sys.path:
@@ -40,10 +44,27 @@ if str(ROOT) not in sys.path:
 from .encoder_ckks import GATEncoderCKKS
 from .fhe_graph import FHEGraph
 
-from .ckks_runner import run_gat_forward_only, run_gat_pipeline_fhe_training
+from .ckks_runner import (
+    _debug_print_ct,
+    run_gat_forward_only,
+    run_gat_pipeline_fhe_training,
+)
 # from .metrics import MetricsRecorder
 from .metrics_pi import MetricsRecorder
 from .utils import rss_bytes, write_metrics_csv
+
+
+def _infer_bootstrap_weights_effective(requested: bool) -> bool:
+    """
+    Match training's bootstrap_weights=True default. Disable with requested=False
+    or env GAT_FHE_INFER_BOOTSTRAP_WEIGHTS=0|false.
+    """
+    if not requested:
+        return False
+    v = os.environ.get("GAT_FHE_INFER_BOOTSTRAP_WEIGHTS", "").strip().lower()
+    if v in ("0", "false", "no"):
+        return False
+    return True
 
 
 def _bootstrap_output_cts(
@@ -66,19 +87,28 @@ def _bootstrap_output_cts(
     n_skipped = 0
     n_failed = 0
 
+
+    debug = os.environ.get("GAT_FHE_DEBUG_CT", "").strip() not in ("", "0", "false", "False")
     for ct in out_cts:
         try:
             current_level = ct.GetLevel()
-
-            print("Current level before bootstrap:", current_level)
-            ct = crypto_context.EvalBootstrap(ct)
-            n_bootstrapped += 1
-            print("Current level after bootstrap:", ct.GetLevel())
-            # if current_level >= bootstrap_level_threshold:
-            #     ct = crypto_context.EvalBootstrap(ct)
-            #     n_bootstrapped += 1
-            # else:
-            #     n_skipped += 1
+            # If threshold==0, always refresh. Otherwise, refresh only when the
+            # ciphertext is near exhaustion per the chosen threshold.
+            if bootstrap_level_threshold == 0 or current_level >= bootstrap_level_threshold:
+                if debug:
+                    try:
+                        print(f"[bootstrap] pre level={int(ct.GetLevel())} noise_scale_deg={int(ct.GetNoiseScaleDeg())}")
+                    except Exception:
+                        print(f"[bootstrap] pre level={int(ct.GetLevel())}")
+                ct = crypto_context.EvalBootstrap(ct)
+                if debug:
+                    try:
+                        print(f"[bootstrap] post level={int(ct.GetLevel())} noise_scale_deg={int(ct.GetNoiseScaleDeg())}")
+                    except Exception:
+                        print(f"[bootstrap] post level={int(ct.GetLevel())}")
+                n_bootstrapped += 1
+            else:
+                n_skipped += 1
 
         except Exception as exc:
             print(
@@ -89,9 +119,6 @@ def _bootstrap_output_cts(
             n_failed += 1
 
         refreshed.append(ct)
-
-    print("Output levels after bootstrap:",
-        [ct.GetLevel() for ct in refreshed])
 
     elapsed = time.perf_counter() - t0
     rss_after = rss_bytes()
@@ -195,12 +222,13 @@ def compute_fhe_training_batch(
     # fresh levels.  run_gat_pipeline_fhe_training with bootstrap_weights=True
     # already bootstraps during training, but we do a final check here in case
     # the last epoch left ct_W_list_new at a low level.
-    # ct_W_list_new, metrics_dict = _bootstrap_output_cts(
-    #     crypto_context=crypto_context,
-    #     out_cts=ct_W_list_new,
-    #     metrics_dict=metrics_dict,
-    #     bootstrap_level_threshold=4,
-    # )
+    ct_W_list_new, metrics_dict = _bootstrap_output_cts(
+        crypto_context=crypto_context,
+        out_cts=ct_W_list_new,
+        metrics_dict=metrics_dict,
+        # Always refresh returned weights before sending them to the client.
+        bootstrap_level_threshold=0,
+    )
 
     return ct_W_list_new, metrics_dict
 
@@ -271,6 +299,17 @@ def compute_fhe_training(
         bootstrap_weights=bootstrap_weights,
     )
 
+    # Force-refresh trained weights before returning them to the client.
+    # This prevents the next batch/client-side operations from starting with
+    # exhausted ciphertexts.
+    if bootstrap_weights:
+        ct_W_list_trained, metrics_dict = _bootstrap_output_cts(
+            crypto_context=crypto_context,
+            out_cts=ct_W_list_trained,
+            metrics_dict=metrics_dict,
+            bootstrap_level_threshold=0,
+        )
+
     # Also record an outer "epoch_total" style metric summarizing the full training call.
     # This uses the same format as other FHE/server metrics so the client can
     # write them out alongside inner pipeline timings if desired.
@@ -298,19 +337,26 @@ def compute_forward_only(
     node_features_enc: list,
     print_metrics: bool = False,
     slots: int | None = None,
+    bootstrap_weights: bool = True,
     bootstrap_output: bool = True,
-    bootstrap_level_threshold: int = 4,
+    bootstrap_level_threshold: int = 0,
 ) -> tuple:
     """
     Run one forward pass (inference only) on a line-graph subgraph. Returns (out_cts, metrics_dict).
     One output ciphertext per node; client interprets logits at target node indices as per-edge predictions.
 
-    After the forward pass the output ciphertexts are refreshed via
-    EvalBootstrap() whenever their remaining multiplicative depth is at or
-    below *bootstrap_level_threshold* (default 4).  This prevents the
-    "approximation error is too high" decryption failure that occurs when the
-    GAT forward pass exhausts the CKKS level budget before the client can
-    decrypt.
+    Aligns with training stability:
+      - *bootstrap_weights* (default True): EvalBootstrap each weight row before forward,
+        like training after each epoch refresh. Override off with bootstrap_weights=False
+        or env GAT_FHE_INFER_BOOTSTRAP_WEIGHTS=0.
+      - Early bootstrap on the per-node softmax accumulator: GAT_FHE_BOOTSTRAP_EARLY;
+        for inference the level trigger defaults lower via GAT_FHE_BOOTSTRAP_THRESHOLD_INFER
+        (default 8) vs training GAT_FHE_BOOTSTRAP_THRESHOLD (default 15).
+
+    After the forward pass, output ciphertexts are refreshed via EvalBootstrap().
+    *bootstrap_level_threshold* default is 0 (always refresh every output), which is
+    stricter than training's conditional pass and helps client-side Decode().
+    Use a positive value only if you need to skip bootstrap for shallow test contexts.
 
     Set bootstrap_output=False to skip bootstrapping (e.g. for unit tests with
     a shallow parameter set that has no bootstrap keys).
@@ -340,6 +386,14 @@ def compute_forward_only(
     )
 
     rec = MetricsRecorder()
+    if _infer_bootstrap_weights_effective(bootstrap_weights):
+        with rec.step("fhe_infer_bootstrap_weights", encrypted=True):
+            for k in range(encoder.out_channels):
+                _debug_print_ct(f"infer W{k} pre_bootstrap", encoder._ct_W_list[k])
+                encoder._ct_W_list[k] = crypto_context.EvalBootstrap(encoder._ct_W_list[k])
+                _debug_print_ct(f"infer W{k} post_bootstrap", encoder._ct_W_list[k])
+            gc.collect()
+
     with rec.step("fhe_infer_forward", encrypted=True):
         out_cts, metrics_dict = run_gat_forward_only(
             encoder=encoder,
@@ -383,7 +437,7 @@ def _replay_bootstrap_setup(payload: dict):
         return  # nothing to do
 
     try:
-        # Must match client EXACTLY
+        # Must match client EXACTLY (see client_keys.create_client_context)
         cc.EvalBootstrapSetup(levelBudget=[4, 4], slots=slots)
     except Exception as e:
         print(f"[server] WARNING: EvalBootstrapSetup replay failed: {e}")

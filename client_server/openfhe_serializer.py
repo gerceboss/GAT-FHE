@@ -15,13 +15,13 @@ OpenFHE BINARY mode is used throughout (most compact native format).
 
 Bootstrap nullptr fix:
   client_keys.py calls:
-      cc.EvalBootstrapSetup(levelBudget=[4,4], slots=slots)
+      cc.EvalBootstrapSetup(levelBudget=[3,3], slots=slots)
   This builds precomputation tables inside the CryptoContext that are keyed
   to a SPECIFIC slot count.  These tables are NOT serialized with the context.
   After the server deserializes the context it has no tables at all, so
   EvalBootstrap() crashes: "KeySwitchDown(): Input ciphertext is nullptr".
 
-  Fix: send bootstrap_level_budget ([4,4] by default) as part of the train
+  Fix: send bootstrap_level_budget ([3,3] by default) as part of the train
   payload.  recv_train_payload() replays:
       cc.EvalBootstrapSetup(levelBudget=bootstrap_level_budget, slots=slots)
   using the SAME level_budget AND the SAME slot count (slots is already
@@ -152,6 +152,15 @@ def _ser_eval_rot(cc: Any) -> bytes:
     s = of.SerializeEvalAutomorphismKeyString(of.BINARY, key_tag)
     return s if isinstance(s, bytes) else s.encode("latin-1")
 
+def _ser_eval_bootstrap(cc: Any) -> bytes:
+    of = _of()
+    try:
+        key_tag = cc.GetKeyTag()
+    except Exception:
+        key_tag = ""
+
+    s = of.SerializeEvalBootstrapKeyString(of.BINARY, key_tag)
+    return s if isinstance(s, bytes) else s.encode("latin-1")
 
 def _deser_eval_mult(data: bytes, cc: Any) -> None:
     of = _of()
@@ -176,6 +185,13 @@ def _deser_eval_rot(data: bytes, cc: Any) -> None:
         if "Can not save a EvalAutomorphismKeys vector" not in str(exc):
             raise
 
+def _deser_eval_bootstrap(data: bytes, cc: Any) -> None:
+    of = _of()
+    try:
+        of.DeserializeEvalBootstrapKeyString(bytes(data), of.BINARY)
+    except RuntimeError as exc:
+        if "Can not save a EvalBootstrapKeys vector" not in str(exc):
+            raise
 
 # ── Bootstrap setup replay ────────────────────────────────────────────────
 
@@ -311,6 +327,7 @@ def send_common_payload(sock: socket.socket, payload: dict) -> None:
     _send_frame(sock, _ser_obj(payload["public_key"]))
     _send_frame(sock, _ser_eval_mult(cc))
     _send_frame(sock, _ser_eval_rot(cc))
+    _send_frame(sock, _ser_eval_bootstrap(cc))
     _send_ct_list(sock, payload["ct_W_list"])
     _send_ct_list(sock, payload["node_features_enc"])
     _send_scalar(
@@ -328,6 +345,7 @@ def recv_common_payload(sock: socket.socket) -> dict:
     pk = _deser_pk(_recv_frame(sock))
     _deser_eval_mult(_recv_frame(sock), cc)
     _deser_eval_rot(_recv_frame(sock), cc)
+    _deser_eval_bootstrap(_recv_frame(sock), cc)
     ct_W_list = _recv_ct_list(sock)
     node_features_enc = _recv_ct_list(sock)
     in_ch, out_ch, slots = struct.unpack("<qqq", _recv_frame(sock))
@@ -367,7 +385,7 @@ def send_train_payload(sock: socket.socket, payload: dict) -> None:
     # Send the level_budget so the server can replay EvalBootstrapSetup with
     # the exact same parameters (levelBudget AND slots=slots) the client
     # used during key generation.  Default [4,4] matches client_keys.py.
-    _send_int_list(sock, list(payload.get("bootstrap_level_budget", [4, 4])))
+    _send_int_list(sock, list(payload.get("bootstrap_level_budget", [3, 3])))
 
 
 def recv_train_payload(sock: socket.socket) -> dict:
@@ -451,11 +469,12 @@ def recv_gradient_step_payload(sock: socket.socket) -> dict:
     lr, num_epochs = struct.unpack("<dq", _recv_frame(sock))
     payload["lr"] = float(lr)
     payload["num_epochs"] = int(num_epochs)
+    payload["bootstrap_level_budget"] = _recv_int_list(sock)
 
     # Replay bootstrap
     _replay_bootstrap_setup(
         payload["crypto_context"],
-        level_budget=[4, 4],
+        level_budget=payload["bootstrap_level_budget"],
         slots=payload["slots"],
     )
 
@@ -475,6 +494,7 @@ def send_gradient_step_payload(sock: socket.socket, payload: dict) -> None:
         float(payload["lr"]),
         int(payload["num_epochs"]),
     )
+    _send_int_list(sock, list(payload.get("bootstrap_level_budget", [4, 4])))
 
 
 def send_gradient_step_result(

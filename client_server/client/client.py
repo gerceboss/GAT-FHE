@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import sys
 import time
@@ -56,6 +57,7 @@ if str(ROOT) not in sys.path:
 
 from client_server.client.client_keys import (
     create_client_context,
+    decrypt_node_features_rows_with_retry,
     openfhe_available,
 )
 from client_server.client.metrics import MetricsRecorder
@@ -295,6 +297,11 @@ class _RestoredClientCtx:
             rows.append([float(vals[k]) for k in range(F_out)])
         return np.array(rows, dtype=np.float64)
 
+    def decrypt_node_features_with_bootstrap_retry(self, out_cts: list, F_out: int):
+        return decrypt_node_features_rows_with_retry(
+            self.crypto_context, self.keys.secretKey, out_cts, F_out
+        )
+
 
 # ── Main ──────────────────────────────────────────────────────────────────
 
@@ -353,6 +360,12 @@ def main() -> None:
         help="CKKS ring dimension (default 16384)",
     )
     parser.add_argument(
+        "--scale_mod_size",
+        type=int,
+        default=50,
+        help="CKKS scaling modulus size in bits (default 50). Increase to improve decode precision (slower/more RAM).",
+    )
+    parser.add_argument(
         "--no_bootstrap", action="store_true", help="Disable weight bootstrapping"
     )
     parser.add_argument("--data", type=str, default=None, help="Path to iot.csv")
@@ -384,6 +397,13 @@ def main() -> None:
         help="Run inference only (requires --load_weights). Skip all training steps.",
     )
     parser.add_argument(
+        "--reuse_encrypted_weights_infer",
+        action="store_true",
+        help="Reuse the same weight ciphertext handles for every inference batch (less client CPU). "
+        "Default is off: re-encrypt from plaintext W each batch so weights start at a full CKKS level "
+        "and stay consistent with server-side weight bootstrap (avoids stale handles / depth drift).",
+    )
+    parser.add_argument(
         "--max_rows_dataset",
         type=int,
         default=None,
@@ -392,7 +412,7 @@ def main() -> None:
     parser.add_argument(
         "--max_degree_batch",
         type=int,
-        default=5,
+        default=3,
         metavar="K",
         help="Cap in-degree per node in each batch (max edges = batch_size*K). Default 5 for FHE memory; use 8--15 for 8GB RAM.",
     )
@@ -462,15 +482,51 @@ def main() -> None:
     # ── Resolve weight-save path ──────────────────────────────────────────────
     weights_save_dir = args.save_weights or f"fhe_weights_{ts}"
 
+    def _resolve_load_weights_dir(path_like: str) -> str:
+        """
+        Accept either:
+          - exact checkpoint dir (meta.json/W.npy/a.npy), or
+          - parent dir containing batch_* checkpoints.
+        """
+        p = Path(path_like)
+        if (p / "meta.json").exists() and (p / "W.npy").exists() and (p / "a.npy").exists():
+            return str(p)
+
+        pointer = p / "last_successful_checkpoint.txt"
+        if pointer.exists():
+            rel = pointer.read_text(encoding="utf-8").strip()
+            if rel:
+                cand = (p / rel).resolve()
+                if (cand / "meta.json").exists() and (cand / "W.npy").exists() and (cand / "a.npy").exists():
+                    return str(cand)
+
+        # fallback: highest batch index with valid files
+        candidates = []
+        for d in p.glob("batch_*"):
+            if d.is_dir() and (d / "meta.json").exists() and (d / "W.npy").exists() and (d / "a.npy").exists():
+                try:
+                    idx = int(d.name.split("_")[-1])
+                except Exception:
+                    idx = -1
+                candidates.append((idx, d))
+        if candidates:
+            candidates.sort(key=lambda t: t[0])
+            return str(candidates[-1][1])
+        return str(p)
+
+    # Plaintext W for per-batch re-encryption during inference (stable Decode vs reusing ct handles).
+    W_plain_for_infer: np.ndarray | None = None
+
     # ══════════════════════════════════════════════════════════════════════════
     #  BRANCH A: load pre-trained weights →  key-gen + training entirely
     # ══════════════════════════════════════════════════════════════════════════
     if args.load_weights:
-        print(f"\n[weights] Loading pre-trained weights from: {args.load_weights}")
+        resolved_load_dir = _resolve_load_weights_dir(args.load_weights)
+        print(f"\n[weights] Loading pre-trained weights from: {resolved_load_dir}")
 
         from client_server.openfhe_serializer import load_trained_weights
 
-        w = load_trained_weights(args.load_weights)
+        w = load_trained_weights(resolved_load_dir)
 
         # Create fresh crypto context (new keys!)
         client_ctx = create_client_context(
@@ -478,13 +534,14 @@ def main() -> None:
             out_channels=w["F_out"],
             slots=w["slots"],
             mult_depth=args.mult_depth,
-            scale_mod_size=50,
+            scale_mod_size=args.scale_mod_size,
             ring_dim=args.ring_dim,
             bootstrap=not args.no_bootstrap,
         )
 
         # Re-encrypt plaintext weights
         W_loaded = np.asarray(w["W_list"], dtype=np.float64)
+        W_plain_for_infer = W_loaded.copy()
         ct_W_trained = client_ctx.encrypt_weight_matrix(W_loaded, w["F_in"])
 
         a = np.asarray(w["a"], dtype=np.float64)
@@ -510,7 +567,7 @@ def main() -> None:
                 out_channels=F_out,
                 slots=slots,
                 mult_depth=args.mult_depth,
-                scale_mod_size=50,
+                scale_mod_size=args.scale_mod_size,
                 ring_dim=args.ring_dim,
                 bootstrap=not args.no_bootstrap,
             )
@@ -581,6 +638,7 @@ def main() -> None:
                 "train_mask": train_mask,
                 "lr": args.lr,
                 "num_epochs": args.epochs,
+                "bootstrap_level_budget": [4, 4],
             }
             if args.host:
                 ct_W_trained, batch_metrics = run_tcp_gradient_step(
@@ -608,6 +666,41 @@ def main() -> None:
             server_train_metrics_list.append(batch_metrics)
             batch_time = sum(step.get("seconds", 0.0) for step in batch_metrics.values())
             print(f"      Local epochs={args.epochs}  server_time={batch_time:.4f}s")
+
+            # Optional per-batch checkpoint: try to decrypt refreshed weights and save
+            # them as plaintext for later --load_weights runs.
+            if args.save_weights:
+                try:
+                    from client_server.openfhe_serializer import save_trained_weights
+
+                    try:
+                        W_ckpt = client_ctx.decrypt_weight_matrix(ct_W_trained, F_in)
+                    except RuntimeError:
+                        # If decode fails, try a client-side bootstrap refresh and retry.
+                        # Client has bootstrap keys, so this is safe and often restores
+                        # decryptability for checkpointing.
+                        cc = client_ctx.crypto_context
+                        ct_W_refreshed = [cc.EvalBootstrap(ct) for ct in ct_W_trained]
+                        W_ckpt = client_ctx.decrypt_weight_matrix(ct_W_refreshed, F_in)
+                        ct_W_trained = ct_W_refreshed
+                    ckpt_dir = os.path.join(str(args.save_weights), f"batch_{b_idx:04d}")
+                    save_trained_weights(
+                        ckpt_dir,
+                        W_list=W_ckpt,
+                        a=a,
+                        slots=slots,
+                        F_in=F_in,
+                        F_out=F_out,
+                    )
+                    print(f"[weights] Checkpoint saved → {ckpt_dir}")
+                    # Update pointer so --load_weights train_weights auto-resolves.
+                    Path(str(args.save_weights)).mkdir(parents=True, exist_ok=True)
+                    (Path(str(args.save_weights)) / "last_successful_checkpoint.txt").write_text(
+                        f"batch_{b_idx:04d}",
+                        encoding="utf-8",
+                    )
+                except RuntimeError as exc:
+                    print(f"[weights] Checkpoint decrypt failed (batch {b_idx}): {exc}")
 
     # ---- Write server training metrics (in-process only; when TCP, server writes to its CWD) ----
     aggregated_train_metrics = {}
@@ -640,6 +733,9 @@ def main() -> None:
             f"\n[weights] WARNING: decrypting trained weights failed; "
             f"skipping plaintext weight saving. Error: {exc}"
         )
+
+    if not args.load_weights and decrypt_ok and W_trained is not None:
+        W_plain_for_infer = np.asarray(W_trained, dtype=np.float64).copy()
 
     a_trained = a
 
@@ -678,7 +774,23 @@ def main() -> None:
 
     # Line-graph inference: batch test line-graph nodes, decrypt; logits at target_indices = edge predictions
     print("\n5. Client: encrypting test line-graph batches for inference...")
+    infer_fresh_weights = (
+        W_plain_for_infer is not None and not args.reuse_encrypted_weights_infer
+    )
+    if infer_fresh_weights:
+        print(
+            "   [client] Inference weights: re-encrypt from plaintext each batch "
+            "(full CKKS level; avoids stale handles after server bootstrap)."
+        )
+    elif n_batches_test > 0 and W_plain_for_infer is None:
+        print(
+            "   [client] WARNING: no plaintext W for inference — reusing encrypted "
+            "weight handles across batches (may worsen Decode / depth)."
+        )
     print(f"\n6. Server: batched FHE inference over {n_test_edges} test edges (line-graph nodes)...")
+    # Same protocol as training: one round-trip per batch — encrypt payload → server
+    # compute_forward_only → return out_cts → client decrypt — then next batch (no
+    # server-side buffering of multiple test batches; TCP opens one connection per batch).
     for b_idx in range(n_batches_test):
         batch_line_ids = np.asarray(test_batches[b_idx], dtype=np.int64)
         x_batch, edge_index_batch, y_batch, target_indices = build_line_graph_batch(
@@ -690,6 +802,10 @@ def main() -> None:
         with client_metrics.step(f"encrypt_batch_{b_idx}", encrypted=True):
             _t0 = time.perf_counter()
             ct_x_batch = client_ctx.encrypt_node_features(x_batch, F_in)
+            if infer_fresh_weights:
+                ct_W_infer = client_ctx.encrypt_weight_matrix(W_plain_for_infer, F_in)
+            else:
+                ct_W_infer = ct_W_trained
             encryption_time = time.perf_counter() - _t0
         infer_payload = {
             "crypto_context": client_ctx.crypto_context,
@@ -697,7 +813,7 @@ def main() -> None:
             "in_channels": F_in,
             "out_channels": F_out,
             "slots": slots,
-            "ct_W_list": ct_W_trained,
+            "ct_W_list": ct_W_infer,
             "a": a_trained,
             "negative_slope": 0.2,
             "num_nodes": x_batch.shape[0],
@@ -706,7 +822,7 @@ def main() -> None:
             "print_metrics": False,
         }
         ct_x_batch_size_bytes = sum(get_ct_size_bytes(ct) for ct in ct_x_batch)
-        ct_W_list_size_bytes = sum(get_ct_size_bytes(ct) for ct in ct_W_trained)
+        ct_W_list_size_bytes = sum(get_ct_size_bytes(ct) for ct in ct_W_infer)
         total_batch_size_bytes = ct_x_batch_size_bytes + ct_W_list_size_bytes
         if args.host:
             out_cts, batch_metrics = run_tcp_infer(args.host, args.port, infer_payload)
@@ -714,11 +830,16 @@ def main() -> None:
             out_cts, batch_metrics = run_infer_inprocess(
                 client_ctx, F_in, F_out, slots,
                 x_batch.shape[0], edge_index_batch, ct_x_batch,
-                ct_W_trained, a_trained,
+                ct_W_infer, a_trained,
             )
         with client_metrics.step(f"decrypt_batch_{b_idx}", encrypted=False):
             _t0 = time.perf_counter()
-            output = client_ctx.decrypt_node_features(out_cts, F_out)
+            output = decrypt_node_features_rows_with_retry(
+                client_ctx.crypto_context,
+                client_ctx.keys.secretKey,
+                out_cts,
+                F_out,
+            )
             decryption_time = time.perf_counter() - _t0
         # One logit per line-graph node; take only target nodes (batch of original edges)
         logits_batch = output[target_indices, 0] if output.ndim > 1 else output[target_indices]
@@ -726,6 +847,8 @@ def main() -> None:
             all_scores.append(float(logits_batch[i]))
             all_labels.append(int(y_batch[target_indices[i]]))
         del out_cts, ct_x_batch
+        if infer_fresh_weights:
+            del ct_W_infer
         server_time_seconds = sum(m.get("seconds", 0.0) for m in (batch_metrics or {}).values())
         max_rss = max((m.get("rss_after_bytes", 0) for m in (batch_metrics or {}).values()), default=0)
         server_energy_joules = sum(m.get("energy_joules", 0.0) for m in (batch_metrics or {}).values())
