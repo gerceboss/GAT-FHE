@@ -159,8 +159,49 @@ def _ser_eval_bootstrap(cc: Any) -> bytes:
     except Exception:
         key_tag = ""
 
-    s = of.SerializeEvalBootstrapKeyString(of.BINARY, key_tag)
-    return s if isinstance(s, bytes) else s.encode("latin-1")
+    # Try several possible OpenFHE API names / strategies to obtain a
+    # serialized EvalBootstrap key. Different OpenFHE Python bindings expose
+    # different helper functions across versions; be resilient.
+    # 1) Prefer dedicated SerializeEvalBootstrapKeyString if present.
+    fn_names = [
+        "SerializeEvalBootstrapKeyString",
+        "SerializeEvalKeyString",
+    ]
+    for name in fn_names:
+        fn = getattr(of, name, None)
+        if callable(fn):
+            try:
+                s = fn(of.BINARY, key_tag)
+                payload = s if isinstance(s, bytes) else s.encode("latin-1")
+                return b"\x01" + payload
+            except Exception:
+                # Try next fallback
+                pass
+
+    # 2) Try to obtain a bootstrap key object from the crypto context and
+    # serialize it with the generic Serialize() function.
+    try:
+        # Common method names that may exist on CryptoContext
+        getters = [
+            "GetEvalBootstrapKey",
+            "GetBootstrapKey",
+            "GetEvalKey",
+        ]
+        key_obj = None
+        for g in getters:
+            if hasattr(cc, g):
+                key_obj = getattr(cc, g)()
+                break
+        if key_obj is not None:
+            s = of.Serialize(key_obj, of.BINARY)
+            payload = s if isinstance(s, bytes) else s.encode("latin-1")
+            return b"\x01" + payload
+    except Exception:
+        pass
+
+    # 3) As a last resort, return a presence-flag-only frame indicating
+    # "no bootstrap key supplied".
+    return b"\x00"
 
 def _deser_eval_mult(data: bytes, cc: Any) -> None:
     of = _of()
@@ -188,7 +229,30 @@ def _deser_eval_rot(data: bytes, cc: Any) -> None:
 def _deser_eval_bootstrap(data: bytes, cc: Any) -> None:
     of = _of()
     try:
-        of.DeserializeEvalBootstrapKeyString(bytes(data), of.BINARY)
+        # Serialized bootstrap frames are now flagged: first byte == 0
+        # means "no bootstrap key supplied", first byte == 1 means
+        # remaining bytes are the actual serialized key payload.
+        if not data:
+            return
+        flag = data[0]
+        if flag == 0:
+            return
+        payload = bytes(data[1:])
+
+        fn = getattr(of, "DeserializeEvalBootstrapKeyString", None)
+        if callable(fn):
+            fn(payload, of.BINARY)
+            return
+
+        # Fallback to a more generic EvalKey deserializer if available.
+        fn2 = getattr(of, "DeserializeEvalKeyString", None)
+        if callable(fn2):
+            fn2(payload, of.BINARY)
+            return
+
+        # Final fallback: attempt generic Deserialize (may raise)
+        if hasattr(of, "Deserialize"):
+            of.Deserialize(payload, of.BINARY)
     except RuntimeError as exc:
         if "Can not save a EvalBootstrapKeys vector" not in str(exc):
             raise

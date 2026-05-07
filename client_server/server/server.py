@@ -199,6 +199,7 @@ def compute_fhe_training_batch(
     train_mask,
     lr,
     num_epochs,
+    bootstrap_level_budget: list | None = None,
 ):
     """
     Perform mini-batch encrypted training on a line-graph subgraph.
@@ -468,8 +469,10 @@ def _replay_bootstrap_setup(payload: dict):
         return  # nothing to do
 
     try:
-        # Must match client EXACTLY (see client_keys.create_client_context)
-        cc.EvalBootstrapSetup(levelBudget=[4, 4], slots=slots)
+        # Must match client EXACTLY (see client_keys.create_client_context).
+        # Use the client's transmitted budget when available; fall back to [4,4].
+        level_budget = payload.get("bootstrap_level_budget", [4, 4])
+        cc.EvalBootstrapSetup(levelBudget=level_budget, slots=slots)
     except Exception as e:
         print(f"[server] WARNING: EvalBootstrapSetup replay failed: {e}")
 
