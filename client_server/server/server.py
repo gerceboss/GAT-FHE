@@ -51,7 +51,38 @@ from .ckks_runner import (
 )
 # from .metrics import MetricsRecorder
 from .metrics_pi import MetricsRecorder
-from .utils import rss_bytes, write_metrics_csv
+from .utils import append_metrics_rows, rss_bytes, write_metrics_csv
+
+
+_SERVER_SESSION_TS_ENV = "GAT_FHE_SERVER_SESSION_TS"
+
+
+def _server_session_ts() -> str:
+    """
+    Stable per-process session timestamp (set by serve() in the parent and
+    inherited by worker processes). If unset (in-process import), generate now.
+    """
+    ts = os.environ.get(_SERVER_SESSION_TS_ENV, "")
+    if ts:
+        return ts
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def _server_metrics_path(kind: str) -> str:
+    """Append-mode CSV path for one server process. kind ∈ {'train','infer','grad'}."""
+    return f"server_fhe_metrics_{kind}_{_server_session_ts()}.csv"
+
+
+def _append_batch_metrics(kind: str, metrics: dict, batch_tag: str) -> None:
+    """Append per-batch server metrics rows, prefixing each row's step with batch_tag."""
+    if not metrics:
+        return
+    rows = []
+    for name, m in metrics.items():
+        row = dict(m)
+        row["phase"] = f"{batch_tag}_{name}"
+        rows.append(row)
+    append_metrics_rows(_server_metrics_path(kind), rows, time_side="server")
 
 
 def _infer_bootstrap_weights_effective(requested: bool) -> bool:
@@ -443,7 +474,7 @@ def _replay_bootstrap_setup(payload: dict):
         print(f"[server] WARNING: EvalBootstrapSetup replay failed: {e}")
 
 
-def _handle_connection(conn: socket.socket, addr: tuple) -> None:
+def _handle_connection(conn: socket.socket, addr: tuple, conn_idx: int = 0) -> None:
     from client_server.openfhe_serializer import (
         recv_train_payload,
         send_train_result,
@@ -466,8 +497,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
                 try:
                     out_cts, metrics, ct_W_trained = compute_fhe_training(**payload)
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_metrics_train_{ts}.csv", metrics)
+                    _append_batch_metrics("train", metrics, f"conn_{conn_idx:04d}")
                     send_ok(conn)
                     send_train_result(conn, out_cts, metrics, ct_W_trained)
                 except Exception as exc:
@@ -482,8 +512,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
                 try:
                     out_cts, metrics = compute_forward_only(**payload)
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_metrics_infer_{ts}.csv", metrics)
+                    _append_batch_metrics("infer", metrics, f"infer_batch_{conn_idx:04d}")
                     send_ok(conn)
                     send_infer_result(conn, out_cts, metrics)
                 except Exception as exc:
@@ -503,8 +532,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
                 try:
                     ct_W_new, metrics = compute_fhe_training_batch(**payload)
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    write_metrics_csv(f"server_fhe_metrics_grad_{ts}.csv", metrics)
+                    _append_batch_metrics("grad", metrics, f"grad_batch_{conn_idx:04d}")
                     send_ok(conn)
                     send_gradient_step_result(conn, ct_W_new, metrics)
                 except Exception as exc:
@@ -526,13 +554,13 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 import multiprocessing
 
 
-def _worker_entry(conn, addr):
+def _worker_entry(conn, addr, conn_idx: int):
     """
     Worker process entry.
     Handles exactly one client connection, then exits.
     """
     try:
-        _handle_connection(conn, addr)
+        _handle_connection(conn, addr, conn_idx=conn_idx)
     finally:
         try:
             conn.close()
@@ -545,7 +573,17 @@ def serve(host: str = "127.0.0.1", port: int = 9999) -> None:
     Start TCP server.
     Each accepted connection is handled in a separate process.
     When the process exits, all OpenFHE memory is released.
+    Per-batch metrics are appended to one stable CSV per server process so
+    consecutive connections within the same wall-clock second do not overwrite
+    each other.
     """
+    if not os.environ.get(_SERVER_SESSION_TS_ENV):
+        os.environ[_SERVER_SESSION_TS_ENV] = time.strftime("%Y%m%d_%H%M%S")
+    print(
+        f"[server] metrics session ts = {os.environ[_SERVER_SESSION_TS_ENV]} "
+        f"(per-batch rows appended to server_fhe_metrics_{{train,infer,grad}}_{os.environ[_SERVER_SESSION_TS_ENV]}.csv)"
+    )
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -560,16 +598,17 @@ def serve(host: str = "127.0.0.1", port: int = 9999) -> None:
         print("[server]  mode: stateless (one worker process per request)")
 
         try:
+            conn_idx = 0
             while True:
                 conn, addr = srv.accept()
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-                print(f"[server] spawning worker for {addr[0]}:{addr[1]}")
+                print(f"[server] spawning worker for {addr[0]}:{addr[1]} (conn_idx={conn_idx})")
 
                 # IMPORTANT: do NOT use daemon=True here
                 p = multiprocessing.Process(
                     target=_worker_entry,
-                    args=(conn, addr),
+                    args=(conn, addr, conn_idx),
                 )
                 p.start()
 
@@ -578,6 +617,7 @@ def serve(host: str = "127.0.0.1", port: int = 9999) -> None:
 
                 # Optional: wait for worker to finish (sequential processing)
                 p.join()
+                conn_idx += 1
 
         except KeyboardInterrupt:
             print("\n[server] shutting down.")

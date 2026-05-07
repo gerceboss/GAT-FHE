@@ -315,6 +315,11 @@ def main() -> None:
     args = parser.parse_args()
     batch_csv_rows = []
     ts = time.strftime("%Y%m%d_%H%M%S")
+    plain_batch_csv_path = f"plain_batch_metrics_{ts}.csv"
+    plain_batch_fieldnames = ["step", "server_time", "edges_in_batch", "phase", "batch"]
+    plain_train_csv_path = f"server_train_metrics_{ts}.csv"
+    plain_infer_csv_path = f"server_infer_metrics_{ts}.csv"
+    from client_server.server.utils import append_dict_rows as _append_dict_rows  # local alias
 
     # Line-graph node dimensions (features = edge features: src_bytes, dst_bytes, duration)
     IN_CHANNELS = 3
@@ -450,11 +455,30 @@ def main() -> None:
                     all_train_metrics_rows.append({**r, "batch": b_idx})
 
             server_t = sum(r.get("seconds", 0.0) for r in batch_metrics_rows)
-            batch_csv_rows.append({
-                "phase": "train", "batch": b_idx, "edges_in_batch": len(batch_line_ids),
-                "server_time_seconds": server_t,
-            })
+            _train_batch_row = {
+                "step": f"train_batch_{b_idx:04d}",
+                "phase": "train",
+                "batch": b_idx,
+                "edges_in_batch": len(batch_line_ids),
+                "server_time": server_t,
+            }
+            batch_csv_rows.append(_train_batch_row)
             print(f"      Completed {args.epochs} epochs  server_t={server_t:.4f}s")
+
+            try:
+                _append_dict_rows(plain_batch_csv_path, [_train_batch_row], plain_batch_fieldnames)
+            except Exception as _csv_exc:
+                print(f"[client] WARN: failed to append plain_batch_metrics row ({b_idx}): {_csv_exc}")
+
+            if batch_metrics_rows:
+                try:
+                    _train_server_rows = [
+                        {**r, "phase": f"train_batch_{b_idx:04d}_epoch_{i}"} for i, r in enumerate(batch_metrics_rows)
+                    ]
+                    from client_server.server.utils import append_metrics_rows as _append_metrics_rows
+                    _append_metrics_rows(plain_train_csv_path, _train_server_rows, time_side="server")
+                except Exception as _csv_exc:
+                    print(f"[client] WARN: failed to append per-batch train server metrics ({b_idx}): {_csv_exc}")
 
             if args.save_weights:
                 ckpt_dir = _save_plain_checkpoint(
@@ -474,9 +498,6 @@ def main() -> None:
                 "W": torch.tensor(W), "a": torch.tensor(a),
             }, os.path.join(args.save_weights, "plain_weights.pt"))
             print(f"[weights] Final weights saved → {os.path.join(args.save_weights, 'plain_weights.pt')}")
-        if not args.host and all_train_metrics_rows:
-            from client_server.server.utils import write_metrics_csv
-            write_metrics_csv(f"server_train_metrics_{ts}.csv", all_train_metrics_rows)
         if args.train_only:
             print("\n✓ Training complete (train_only). Exiting.")
             return
@@ -490,7 +511,8 @@ def main() -> None:
         all_logits = []
         all_y_true = []
         server_batch_metrics_list = []
-        batch_csv_rows = []
+        # Note: do NOT reset batch_csv_rows here so the final summary still
+        # accounts for any train rows; per-batch CSV is already incremental.
 
         for b_idx in range(n_batches_test):
             batch_line_ids = np.asarray(test_batches[b_idx], dtype=np.int64)
@@ -542,19 +564,31 @@ def main() -> None:
             server_batch_metrics_list.append(batch_metrics)
             _b_seconds = batch_metrics.get("seconds", 0.0)
             print(f"   Batch {b_idx+1}/{n_batches_test} server_t={_b_seconds:.4f}s")
-            batch_csv_rows.append({
-                "step": f"infer_batch_{b_idx}",
+            _infer_batch_row = {
+                "step": f"infer_batch_{b_idx:04d}",
+                "phase": "infer",
+                "batch": b_idx,
                 "server_time": _b_seconds,
                 "edges_in_batch": len(batch_line_ids),
-            })
+            }
+            batch_csv_rows.append(_infer_batch_row)
 
-    import csv
-    csv_path = f"plain_batch_metrics_{ts}.csv"
+            try:
+                _append_dict_rows(plain_batch_csv_path, [_infer_batch_row], plain_batch_fieldnames)
+            except Exception as _csv_exc:
+                print(f"[client] WARN: failed to append plain_batch_metrics row ({b_idx}): {_csv_exc}")
+
+            if batch_metrics:
+                try:
+                    _row = dict(batch_metrics)
+                    _row["phase"] = f"infer_batch_{b_idx:04d}"
+                    from client_server.server.utils import append_metrics_rows as _append_metrics_rows
+                    _append_metrics_rows(plain_infer_csv_path, [_row], time_side="server")
+                except Exception as _csv_exc:
+                    print(f"[client] WARN: failed to append per-batch infer server metrics ({b_idx}): {_csv_exc}")
+
+    csv_path = plain_batch_csv_path
     if batch_csv_rows:
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["step", "server_time", "edges_in_batch", "phase", "batch"], extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(batch_csv_rows)
         print(f"[client] Metrics written → {csv_path}")
     if not args.host and server_batch_metrics_list:
         from client_server.server.utils import write_metrics_csv
@@ -574,11 +608,12 @@ def main() -> None:
         write_metrics_csv(f"server_infer_metrics_{ts}.csv", infer_metrics_rows)
 
     if not args.train_only and all_logits:
+        import csv as _csv
         n_test = len(all_y_true)
-        Tserver = sum(r["server_time"] for r in batch_csv_rows)
+        Tserver = sum(r.get("server_time", 0.0) for r in batch_csv_rows)
         summary_path = f"plain_summary_{ts}.csv"
         with open(summary_path, "w", newline="") as f:
-            writer = csv.writer(f)
+            writer = _csv.writer(f)
             writer.writerow(["Tserver", Tserver])
             writer.writerow(["n_test_edges", n_test])
         print(f"[client] Summary → {summary_path}")

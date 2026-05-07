@@ -184,15 +184,6 @@ The FHE path is **fully encrypted** (CKKS). The server never sees the secret key
 - Adjust CKKS parameters (`mult_depth`, `scale_mod_size`) in the server/client as needed.
 - Process graphs in batches; see `client_server/README.md` for batching and throughput.
 
-## Future Enhancements
-
-Planned improvements:
-- [ ] Batched graph processing
-- [ ] Multi-GPU support for parallel encryption
-- [ ] Adaptive depth selection based on graph size
-- [ ] Caching for repeated inference
-- [ ] TFHE scheme support
-- [ ] Automatic parameter tuning
 
 ## References
 

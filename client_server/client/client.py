@@ -68,7 +68,11 @@ from client_server.client.utils import (
     load_iot_edge_train_test,
     make_connected_batches,
 )
-from client_server.server.utils import write_metrics_csv as write_server_metrics_csv
+from client_server.server.utils import (
+    append_dict_rows,
+    append_metrics_rows,
+    write_metrics_csv as write_server_metrics_csv,
+)
 
 from client_server.openfhe_serializer import (
     send_gradient_step_payload,
@@ -667,6 +671,17 @@ def main() -> None:
             batch_time = sum(step.get("seconds", 0.0) for step in batch_metrics.values())
             print(f"      Local epochs={args.epochs}  server_time={batch_time:.4f}s")
 
+            try:
+                _per_batch_train_rows = []
+                for _name, _step in (batch_metrics or {}).items():
+                    _row = dict(_step)
+                    _row["phase"] = f"train_batch_{b_idx:04d}_{_name}"
+                    _per_batch_train_rows.append(_row)
+                if _per_batch_train_rows:
+                    append_metrics_rows(server_train_metrics_path, _per_batch_train_rows, time_side="server")
+            except Exception as _csv_exc:
+                print(f"[client] WARN: failed to append per-batch train metrics ({b_idx}): {_csv_exc}")
+
             # Optional per-batch checkpoint: try to decrypt refreshed weights and save
             # them as plaintext for later --load_weights runs.
             if args.save_weights:
@@ -702,15 +717,8 @@ def main() -> None:
                 except RuntimeError as exc:
                     print(f"[weights] Checkpoint decrypt failed (batch {b_idx}): {exc}")
 
-    # ---- Write server training metrics (in-process only; when TCP, server writes to its CWD) ----
-    aggregated_train_metrics = {}
-    for idx, batch_m in enumerate(server_train_metrics_list):
-        for name, step in batch_m.items():
-            key = f"batch_{idx}_{name}"
-            aggregated_train_metrics[key] = step
-
-    if not args.host and aggregated_train_metrics:
-        write_server_metrics_csv(server_train_metrics_path, aggregated_train_metrics)
+    # Per-batch train metrics are already appended inside the loop to
+    # `server_train_metrics_path` so partial runs and TCP runs both have rows.
 
     # Decrypt weight ciphertexts → numpy matrix (F_out, F_in) for saving.
     # Note: decoding can fail when the final ciphertext noise/level is still
@@ -771,6 +779,16 @@ def main() -> None:
     all_labels: list[int] = []
     server_infer_metrics_list: list[dict] = []
     batch_csv_rows = []
+
+    fhe_batch_csv_ts = time.strftime("%Y%m%d_%H%M%S")
+    fhe_batch_csv_path = f"fhe_batch_metrics_{fhe_batch_csv_ts}.csv"
+    fhe_batch_fieldnames = [
+        "step", "server_time", "client_time", "rss_after_bytes", "rss_delta_bytes",
+        "power_watts", "energy_joules", "throughput", "batch", "nodes_in_batch",
+        "edges_in_batch", "client_encryption_time", "client_decryption_time",
+        "ciphertext_size_bytes", "ct_x_batch_size_bytes", "ct_W_list_size_bytes",
+        "total_ciphertext_batch_size_bytes",
+    ]
 
     # Line-graph inference: batch test line-graph nodes, decrypt; logits at target_indices = edge predictions
     print("\n5. Client: encrypting test line-graph batches for inference...")
@@ -856,7 +874,7 @@ def main() -> None:
         server_power = server_energy_joules / server_time_seconds if server_time_seconds > 0 else 0.0
         client_time_batch = encryption_time + decryption_time
         throughput = (len(batch_line_ids) / (server_time_seconds + client_time_batch)) if (server_time_seconds + client_time_batch) > 0 else 0.0
-        batch_csv_rows.append({
+        _batch_row = {
             "step": f"fhe_batch_{b_idx}",
             "server_time": server_time_seconds,
             "client_time": client_time_batch,
@@ -874,30 +892,31 @@ def main() -> None:
             "ct_x_batch_size_bytes": ct_x_batch_size_bytes,
             "ct_W_list_size_bytes": ct_W_list_size_bytes,
             "total_ciphertext_batch_size_bytes": total_batch_size_bytes,
-        })
+        }
+        batch_csv_rows.append(_batch_row)
         server_infer_metrics_list.append(batch_metrics or {})
 
-    # ---- Write server infer metrics (in-process only; when TCP, server writes to its CWD) ----
-    if not args.host and server_infer_metrics_list:
-        infer_rows = []
-        for i, batch_m in enumerate(server_infer_metrics_list):
-            for name, m in batch_m.items():
-                infer_rows.append({"phase": f"infer_batch_{i}_{name}", **m})
-        write_server_metrics_csv(server_infer_metrics_path, infer_rows)
+        try:
+            append_dict_rows(fhe_batch_csv_path, [_batch_row], fhe_batch_fieldnames)
+        except Exception as _csv_exc:
+            print(f"[client] WARN: failed to append fhe_batch_metrics row ({b_idx}): {_csv_exc}")
 
-    # ---- Write batch metrics to CSV ----
-    import csv
+        if batch_metrics:
+            try:
+                _per_batch_infer_rows = []
+                for _name, _m in batch_metrics.items():
+                    _row = dict(_m)
+                    _row["phase"] = f"infer_batch_{b_idx:04d}_{_name}"
+                    _per_batch_infer_rows.append(_row)
+                if _per_batch_infer_rows:
+                    append_metrics_rows(server_infer_metrics_path, _per_batch_infer_rows, time_side="server")
+            except Exception as _csv_exc:
+                print(f"[client] WARN: failed to append per-batch infer metrics ({b_idx}): {_csv_exc}")
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = f"fhe_batch_metrics_{ts}.csv"
-
-    batch_fieldnames = ["step", "server_time", "client_time", "rss_after_bytes", "rss_delta_bytes", "power_watts", "energy_joules", "throughput", "batch", "nodes_in_batch", "edges_in_batch", "client_encryption_time", "client_decryption_time", "ciphertext_size_bytes", "ct_x_batch_size_bytes", "ct_W_list_size_bytes", "total_ciphertext_batch_size_bytes"]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=batch_fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(batch_csv_rows)
-
-    print(f"[client] FHE per-batch metrics written → {csv_path}")
+    print(f"[client] FHE per-batch metrics written → {fhe_batch_csv_path}")
+    csv_path = fhe_batch_csv_path
+    ts = fhe_batch_csv_ts
+    import csv  # noqa: F401  (kept for downstream summary writer)
 
     Tenc = sum(r["client_encryption_time"] for r in batch_csv_rows)
     Tserver = sum(r["server_time"] for r in batch_csv_rows)

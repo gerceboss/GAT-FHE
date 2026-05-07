@@ -117,6 +117,8 @@ def write_metrics_csv(
     path: str,
     data: Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]],
     time_side: str = "server",
+    *,
+    append: bool = False,
 ) -> None:
     """
     Write metrics to a CSV file with standard columns:
@@ -124,6 +126,7 @@ def write_metrics_csv(
 
     time_side: "server" (default) | "client" | "both"
       Use "server" for server-side metrics, "client" for client-side (keygen, encrypt, decrypt phases), "both" for per-batch rows that have both.
+    append: when True, append rows to an existing file (write header only if missing/empty).
     """
     if not data:
         return
@@ -140,12 +143,44 @@ def write_metrics_csv(
     if not rows:
         return
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    file_existed = append and os.path.isfile(path) and os.path.getsize(path) > 0
+    mode = "a" if append else "w"
+    with open(path, mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(METRICS_CSV_FIELDS), extrasaction="ignore")
-        writer.writeheader()
+        if not file_existed:
+            writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[server] metrics written → {path}")
+    if not append:
+        print(f"[server] metrics written → {path}")
+
+
+def append_metrics_rows(
+    path: str,
+    data: Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]],
+    time_side: str = "server",
+) -> None:
+    """Convenience wrapper: append normalised rows; create file with header if needed."""
+    write_metrics_csv(path, data, time_side=time_side, append=True)
+
+
+def append_dict_rows(
+    path: str,
+    rows: List[Dict[str, Any]],
+    fieldnames: List[str],
+) -> None:
+    """
+    Append arbitrary-schema rows to a CSV (write header if file is new/empty).
+    Used for client-side per-batch metrics where columns differ from the standard schema.
+    """
+    if not rows:
+        return
+    file_existed = os.path.isfile(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not file_existed:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 # ── TCP framing ──────────────────────────────────────────────────────────────
