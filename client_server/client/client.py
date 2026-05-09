@@ -974,6 +974,17 @@ def main() -> None:
     print(f"F1 Score  : {cls_metrics['f1']:.4f}")
     print(f"Test {target_name}: {len(y_true)}  |  Batches: {n_batches_test}")
 
+    # Write classification results to a txt file
+    classification_txt_path = f"fhe_classification_results_{ts}.txt"
+    with open(classification_txt_path, "w") as f:
+        f.write("=== FHE Test-set Classification Results ===\n")
+        f.write(f"Accuracy  : {cls_metrics['accuracy']:.4f}\n")
+        f.write(f"Precision : {cls_metrics['precision']:.4f}\n")
+        f.write(f"Recall    : {cls_metrics['recall']:.4f}\n")
+        f.write(f"F1 Score  : {cls_metrics['f1']:.4f}\n")
+        f.write(f"Test {target_name}: {len(y_true)}  |  Batches: {n_batches_test}\n")
+    print(f"[client] Classification results written → {classification_txt_path}")
+
     # 9. End-to-end latency and energy summary (encrypted path)
     client_m = client_metrics.to_dict()
 

@@ -60,6 +60,7 @@ METRICS_CSV_FIELDS = (
     "power_watts",
     "energy_joules",
     "throughput",
+    "error",
 )
 
 

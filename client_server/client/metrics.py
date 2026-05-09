@@ -53,6 +53,7 @@ class StepMetric:
     encrypted: bool = True
     energy_joules: float = 0.0
     power_watts: float = 0.0
+    error: Optional[str] = None
 
 
 class MetricsRecorder:
@@ -74,6 +75,7 @@ class MetricsRecorder:
                 "encrypted": m.encrypted,
                 "energy_joules": m.energy_joules,
                 "power_watts": m.power_watts,
+                "error": m.error,
             }
             for m in self._metrics
         }
@@ -91,6 +93,7 @@ class MetricsRecorder:
                     encrypted=bool(m.get("encrypted", True)),
                     energy_joules=float(m.get("energy_joules", 0.0)),
                     power_watts=float(m.get("power_watts", 0.0)),
+                    error=m.get("error"),
                 )
             )
         return rec
@@ -174,6 +177,8 @@ class _StepContext:
             energy_j = (e1 - e0) / 1e6
             power_w = energy_j / dt
 
+        error = str(exc) if exc else None
+
         self._rec.add(
             StepMetric(
                 name=self._name,
@@ -183,5 +188,6 @@ class _StepContext:
                 encrypted=self._encrypted,
                 energy_joules=energy_j,
                 power_watts=power_w,
+                error=error,
             )
         )

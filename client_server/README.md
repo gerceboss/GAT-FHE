@@ -911,3 +911,8 @@ BINARY serialisation is not guaranteed to be cross-version compatible. Both mach
 ```bash
 python -c "import openfhe; print(openfhe.__version__)"
 ```
+
+
+
+1. python -m client_server.client.client --batch_size 30 --save_weights train_1 --train_only --max_rows_dataset 500 --host 10.81.49.148 --port 9999
+2.  python -m client_server.client.client --batch_size 30 --load_weights train_1 --infer_only --max_rows_dataset 500 --host 10.81.49.148 --port 9999
